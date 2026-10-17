@@ -454,12 +454,16 @@ python tools\probe_background.py
 
 ## 测试
 
+两套测试，按「要不要真实的 Windows 消息循环」分开：
+
 ```powershell
-python tests\test_smoke.py
+python tests\test_smoke.py           # 139 个用例，任何平台都能跑
+python tests\test_win_integration.py # 18 个用例，只认 Windows（其它平台自动 skip）
 ```
 
-139 个用例，使用 Qt 的 `offscreen` 平台插件，不会真的弹窗，也不会真的点鼠标
-（引擎测试使用 `FakeBackend` + 注入的假抓屏函数，并校验完整事件时间线）。覆盖：
+`test_smoke.py` 使用 Qt 的 `offscreen` 平台插件，不会真的弹窗，也不会真的点鼠标
+（引擎测试使用 `FakeBackend` + 注入的假抓屏函数，并校验完整事件时间线）。
+`test_win_integration.py` 反过来：**真的建窗口、真的投消息**，细节见本节末尾。覆盖：
 
 - `INPUT` 结构体大小与联合体内存共享语义
 - 虚拟屏幕坐标读取、单实例守卫、热键键码表
@@ -495,10 +499,22 @@ python tests\test_smoke.py
   失效句柄拒绝绑定、未绑定时按坐标兜底找窗口、找不到目标时不投递且只警告一次
 - 拆分出来的子系统：托盘菜单转发（`QAction.triggered` 捎带的参数要被丢掉）、
   无托盘时的降级、录制落地的替换/追加语义、日志 handler 的成对挂载与摘除
+- **真实窗口上的后台点击**（`test_win_integration.py`）：自造带 `WndProc` 的顶层窗口 + 子窗口，
+  验证客户区↔屏幕坐标往返、命中点下钻到最内层子窗口、不可见与 `WS_EX_TRANSPARENT` 子窗口被穿透、
+  点击真的由目标窗口收到（`WM_MOUSEMOVE → 按下 → 抬起`，`lParam` 是正确的客户区坐标）、
+  右键分支、只投 `WM_MOUSEMOVE` 的移动、后台键盘的按键与扫描码、按点绑定归一化到顶层窗口、
+  失效句柄拒绝绑定
 
-`app/win/*` 与 GDI 抓屏这层不做自动化断言，改为真机联调验证（抓一帧 → 抠一块当模板 →
-必须一次命中且坐标精确、通道差为 0）。其中后台点击只对**消息构造与坐标换算**做断言
-（把 `post_message` / 窗口查询函数换成假的），「投出去的消息目标程序认不认」仍然只能真机验证。
+`SendInput` 注入与 GDI 抓屏这两层不做自动化断言，改为真机联调验证（抓一帧 → 抠一块当模板 →
+必须一次命中且坐标精确、通道差为 0）。
+
+后台点击则是**两层都测**：`test_smoke.py` 把 `post_message` / 窗口查询函数换成假的，断言
+「逻辑上发给谁、发什么消息、坐标换算对不对」；`test_win_integration.py` 在**真实的** Win32
+窗口上把整条链路跑一遍——消息真的投出去、真的由目标窗口的 `WndProc` 收下。于是
+`PostMessageBackend` 的实现细节在自动化测试里就有断言守着，而不是只能靠肉眼。
+
+真机仍无法被替代的只剩一件事：**目标程序认不认 `WM_*`**。这取决于对方是什么框架，用
+`tools\probe_background.py` 现场判定（见「后台点击」一节）。
 
 ---
 
@@ -552,7 +568,8 @@ auto-clicker/
 │  └─ utils/
 │     └─ logger.py             # 滚动文件日志 + 转发给 UI 的 handler
 └─ tests/
-   └─ test_smoke.py
+   ├─ test_smoke.py
+   └─ test_win_integration.py     # 真实 Win32 窗口上的后台点击集成测试（仅 Windows）
 ```
 
 ---
@@ -597,7 +614,7 @@ pyinstaller --noconfirm --onefile --windowed --name AutoClicker main.py
 
 ## 从零重建项目（bootstrap.py）
 
-`bootstrap.py` 把整份项目（46 个文件）硬编码在自己内部，不读任何原始文件就能还原出完整项目，
+`bootstrap.py` 把整份项目（47 个文件）硬编码在自己内部，不读任何原始文件就能还原出完整项目，
 适合打包分发「一个文件就是一个项目」：
 
 ```powershell
