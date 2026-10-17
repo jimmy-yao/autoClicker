@@ -1007,6 +1007,22 @@ class TestEngine(unittest.TestCase):
         self.assertIn("抓取屏幕", failures[0])
         self.assertFalse(engine.running)
 
+    def test_engine_switches_backend_only_when_idle(self):
+        """前端可在 start 前换后端；运行途中必须拒绝，免得同一次运行混用两种注入。"""
+        from app.core.engine import MacroEngine
+
+        engine = MacroEngine(FakeBackend())
+        other = FakeBackend()
+        engine.set_backend(other)
+        self.assertIs(engine._backend, other)
+
+        engine._running = True
+        try:
+            with self.assertRaises(RuntimeError):
+                engine.set_backend(FakeBackend())
+        finally:
+            engine._running = False
+
 
 # ==================================================================== 录制转换
 def _down(t, x=0, y=0, button="left"):
@@ -1915,6 +1931,60 @@ class TestUI(unittest.TestCase):
                 window._shutdown()
                 self.app.processEvents()
 
+    def test_main_window_backend_switch(self):
+        """默认前台注入；勾上「后台点击」后换 PostMessage 后端，并可用绑定窗口。"""
+        from unittest import mock
+
+        from app.input import postmessage as pm
+        from app.input.sendinput import SendInputBackend
+        from app.storage.config import ProfileStore
+        from app.ui.main_window import MainWindow
+        from app.win.hotkey import HotkeyManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            foreground = SendInputBackend()
+            window = MainWindow(
+                foreground, HotkeyManager(self.app), store=ProfileStore(Path(tmp))
+            )
+            try:
+                self.assertFalse(window._background_check.isChecked())
+                self.assertIs(window._active_backend(), foreground)
+                self.assertFalse(
+                    window._bind_button.isEnabled(), "没开后台模式时绑定按钮应置灰"
+                )
+
+                window._background_check.setChecked(True)
+                self.app.processEvents()
+                backend = window._active_backend()
+                self.assertIsNot(backend, foreground)
+                self.assertEqual(backend.name, "postmessage")
+                self.assertTrue(window._bind_button.isEnabled())
+                self.assertIn("未绑定", window._bind_label.text())
+
+                # 绑定窗口：坐标点 → 顶层窗口，成功后标签显示目标
+                with mock.patch.multiple(
+                    pm,
+                    window_from_point=lambda x, y: 0x1234,
+                    is_window=lambda hwnd: True,
+                    root_window=lambda hwnd: 0x1234,
+                    describe=lambda hwnd: "记事本 [Notepad]",
+                ):
+                    window._bind_window_at(10, 10)
+                self.assertEqual(backend.bound_window, 0x1234)
+                self.assertIn("记事本", window._bind_label.text())
+
+                # start 之前会把选中的后端交给引擎
+                with mock.patch.object(window._run, "set_backend") as set_backend, mock.patch.object(
+                    window._run, "start"
+                ):
+                    window._minimize_check.setChecked(False)
+                    window.start_clicking()
+                set_backend.assert_called_once()
+                self.assertIs(set_backend.call_args.args[0], backend)
+            finally:
+                window._shutdown()
+                self.app.processEvents()
+
     def test_main_window_assembly(self):
         from app.input.sendinput import SendInputBackend
         from app.storage.config import ProfileStore
@@ -2349,6 +2419,228 @@ class TestUI(unittest.TestCase):
 
         with mock.patch.object(shot, "app_data_dir", side_effect=OSError("磁盘满了")):
             self.assertIsNone(shot.save_frame(_frame(4, 4)))
+
+
+# ==================================================================== 后台点击
+class TestPostMessageBackend(unittest.TestCase):
+    """PostMessage 后端的消息构造与目标解析。
+
+    不真的往别的窗口投消息：把 ``post_message`` 和窗口查询函数全部换成假的，
+    只校验「发给了谁、发了什么消息、坐标换算对不对」。
+    """
+
+    def test_make_lparam_packs_client_coords(self):
+        from app.input.postmessage import _make_lparam
+
+        self.assertEqual(_make_lparam(0x0102, 0x0304), 0x03040102, "低 16 位 x、高 16 位 y")
+        # 点在客户区外时坐标为负，按 16 位截断即可，不能抛
+        self.assertEqual(_make_lparam(-1, -1), 0xFFFFFFFF)
+
+    def test_key_lparam_marks_keyup(self):
+        from app.input.postmessage import _key_lparam
+
+        down = _key_lparam(0x1E, up=False)
+        up = _key_lparam(0x1E, up=True)
+        self.assertEqual(down & 0xFFFF, 1, "重复次数应为 1")
+        self.assertEqual((down >> 16) & 0xFF, 0x1E, "lParam 里要带扫描码")
+        self.assertEqual(up - down, (1 << 30) | (1 << 31), "抬起要置 bit30/31")
+
+    def test_click_posts_move_down_up_in_client_coords(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        sent = []
+        with mock.patch.multiple(
+            pm,
+            is_window=lambda hwnd: True,
+            root_window=lambda hwnd: 0x1234,
+            describe=lambda hwnd: "目标 [TestClass]",
+            deepest_child_at=lambda base, x, y: 0x5678,
+            screen_to_client=lambda hwnd, x, y: (10, 20),
+            post_message=lambda hwnd, msg, wp=0, lp=0: sent.append((hwnd, msg, wp, lp)) or True,
+        ):
+            backend = pm.PostMessageBackend()
+            self.assertTrue(backend.bind_window(0x1234))
+            backend.click(500, 400, MouseButton.LEFT)
+
+        inner = pm._make_lparam(10, 20)
+        self.assertEqual(
+            sent,
+            [
+                (0x5678, pm.WM_MOUSEMOVE, 0, inner),
+                (0x5678, pm.WM_LBUTTONDOWN, pm.MK_LBUTTON, inner),
+                (0x5678, pm.WM_LBUTTONUP, 0, inner),
+            ],
+            "应先 WM_MOUSEMOVE 再按下/抬起，并投递给该点下最内层的子窗口",
+        )
+
+    def test_click_uses_button_specific_messages(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        sent = []
+        with mock.patch.multiple(
+            pm,
+            is_window=lambda hwnd: True,
+            root_window=lambda hwnd: 0x10,
+            describe=lambda hwnd: "w",
+            deepest_child_at=lambda base, x, y: base,
+            screen_to_client=lambda hwnd, x, y: (0, 0),
+            post_message=lambda hwnd, msg, wp=0, lp=0: sent.append((msg, wp)) or True,
+        ):
+            backend = pm.PostMessageBackend()
+            backend.bind_window(0x10)
+            backend.click(1, 1, MouseButton.RIGHT)
+
+        self.assertEqual(
+            sent[1], (pm.WM_RBUTTONDOWN, pm.MK_RBUTTON)
+        )
+        self.assertEqual(sent[2], (pm.WM_RBUTTONUP, 0))
+
+    def test_move_to_posts_only_mousemove(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        sent = []
+        with mock.patch.multiple(
+            pm,
+            is_window=lambda hwnd: True,
+            root_window=lambda hwnd: 0x10,
+            describe=lambda hwnd: "w",
+            deepest_child_at=lambda base, x, y: base,
+            screen_to_client=lambda hwnd, x, y: (7, 8),
+            post_message=lambda hwnd, msg, wp=0, lp=0: sent.append((hwnd, msg, wp, lp)) or True,
+        ):
+            backend = pm.PostMessageBackend()
+            backend.bind_window(0x10)
+            backend.move_to(100, 200)
+
+        self.assertEqual(sent, [(0x10, pm.WM_MOUSEMOVE, 0, pm._make_lparam(7, 8))])
+
+    def test_press_key_posts_keydown_keyup_with_scancode(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        sent = []
+        with mock.patch.multiple(
+            pm,
+            is_window=lambda hwnd: True,
+            root_window=lambda hwnd: 0x10,
+            describe=lambda hwnd: "w",
+            map_virtual_key=lambda vk: 0x1E,
+            foreground_window=lambda: None,
+            post_message=lambda hwnd, msg, wp=0, lp=0: sent.append((hwnd, msg, wp, lp)) or True,
+        ):
+            backend = pm.PostMessageBackend()
+            backend.bind_window(0x10)
+            backend.press_key(0x41)
+
+        self.assertEqual(
+            sent,
+            [
+                (0x10, pm.WM_KEYDOWN, 0x41, pm._key_lparam(0x1E, up=False)),
+                (0x10, pm.WM_KEYUP, 0x41, pm._key_lparam(0x1E, up=True)),
+            ],
+        )
+
+    def test_bind_window_rejects_dead_handle(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        with mock.patch.multiple(pm, is_window=lambda hwnd: False):
+            backend = pm.PostMessageBackend()
+            self.assertFalse(backend.bind_window(0))
+            self.assertFalse(backend.bind_window(0xDEAD))
+            self.assertIsNone(backend.bound_window)
+            self.assertEqual(backend.bound_title, "")
+
+    def test_bind_window_normalizes_to_root(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        with mock.patch.multiple(
+            pm, is_window=lambda hwnd: True, root_window=lambda hwnd: 0x2200, describe=lambda hwnd: "win"
+        ):
+            backend = pm.PostMessageBackend()
+            self.assertTrue(backend.bind_window(0x22FF))
+            self.assertEqual(backend.bound_window, 0x2200, "应归一化到顶层窗口")
+            self.assertEqual(backend.bound_title, "win")
+
+    def test_bind_point_uses_window_under_cursor(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        with mock.patch.multiple(
+            pm,
+            window_from_point=lambda x, y: 0x2222,
+            is_window=lambda hwnd: True,
+            root_window=lambda hwnd: 0x2200,
+            describe=lambda hwnd: "win",
+        ):
+            backend = pm.PostMessageBackend()
+            self.assertTrue(backend.bind_point(10, 10))
+            self.assertEqual(backend.bound_window, 0x2200)
+
+    def test_unbound_click_falls_back_to_window_at_point(self):
+        """没绑定窗口时应退化为「按坐标找当时最顶层的窗口」，而不是直接失灵。"""
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        sent = []
+        with mock.patch.multiple(
+            pm,
+            window_from_point=lambda x, y: 0x9999,
+            deepest_child_at=lambda base, x, y: base,
+            screen_to_client=lambda hwnd, x, y: (1, 2),
+            post_message=lambda hwnd, msg, wp=0, lp=0: sent.append((hwnd, msg)) or True,
+        ):
+            backend = pm.PostMessageBackend()
+            backend.click(3, 4)
+
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[0][0], 0x9999)
+
+    def test_no_target_warns_once_and_posts_nothing(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        sent = []
+        with mock.patch.multiple(
+            pm,
+            window_from_point=lambda x, y: None,
+            post_message=lambda *args: sent.append(args) or True,
+        ):
+            backend = pm.PostMessageBackend()
+            with self.assertLogs("app.input.postmessage", level="WARNING") as captured:
+                backend.click(1, 2)
+                backend.click(3, 4)
+
+        self.assertEqual(sent, [], "没有目标窗口时不应投递任何消息")
+        self.assertEqual(len(captured.records), 1, "同一个原因只应提醒一次，不刷屏")
+
+    def test_unbind_clears_target(self):
+        from unittest import mock
+
+        from app.input import postmessage as pm
+
+        with mock.patch.multiple(
+            pm, is_window=lambda hwnd: True, root_window=lambda hwnd: 0x10, describe=lambda hwnd: "w"
+        ):
+            backend = pm.PostMessageBackend()
+            backend.bind_window(0x10)
+            backend.unbind()
+
+        self.assertIsNone(backend.bound_window)
+        self.assertEqual(backend.bound_title, "")
 
 
 if __name__ == "__main__":

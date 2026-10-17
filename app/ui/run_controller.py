@@ -85,6 +85,13 @@ class RunController(QObject):
         """请求停止。立刻返回，不等工作线程收工。"""
         self._engine.request_stop()
 
+    def set_backend(self, backend: InputBackend) -> None:
+        """切换输入后端（前台 SendInput / 后台 PostMessage）。
+
+        供 MainWindow 在 ``start`` 之前按界面上的选择调用。
+        """
+        self._engine.set_backend(backend)
+
     def shutdown(self) -> None:
         """停引擎 + 回收线程。退出流程用，可以重复调用。"""
         try:

@@ -132,6 +132,17 @@ class MacroEngine(QObject):
         """请求停止。可从任意线程调用。"""
         self._stop_event.set()
 
+    def set_backend(self, backend: InputBackend) -> None:
+        """切换输入后端（前台 SendInput / 后台 PostMessage）。
+
+        只在未运行时允许切换：``_backend`` 只在工作线程里被读，运行途中替换会让
+        同一次运行混用两种注入方式。UI 侧统一在 start 之前调用，所以碰不到这条限制。
+        """
+        with self._lock:
+            if self._running:
+                raise RuntimeError("运行中不能切换输入后端")
+            self._backend = backend
+
     # ------------------------------------------------------------------ 主循环
     def _execute(self, profile: Profile, steps: list[Step]) -> None:
         if profile.start_delay_ms:

@@ -28,6 +28,7 @@
     │        启动延迟 · 序列轮数 · 轮次间隔            │
     ├ 步骤序列（StepEditor）  ┬ 日志（可拖动分隔条）────┤
     ├─ 开始 / 停止 · 状态 · 进度条 ────────────────────┤
+    ├─ 输入方式：前台 SendInput / 后台 PostMessage ────┤
     └─ 状态栏：热键提示 ───────────────────────────────┘
 
 跨线程通信一律走信号：``MacroEngine`` 在工作线程里发信号，槽在主线程序列化执行。
@@ -102,6 +103,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._hotkeys = hotkeys
         self._picker = PickCoordinator(self)
+        # 前台后端由 main.py 注入；后台后端在用户第一次切到后台模式时才创建，
+        # 免得不开后台模式也去 import 一堆 Win32 消息相关的东西
+        self._foreground_backend = backend
+        self._background_backend = None
         self._hotkey_ready: dict[int, bool] = {}
         self._force_quit = False
         self._shutdown_done = False
@@ -288,6 +293,8 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         root.addLayout(row)
 
+        root.addLayout(self._build_backend_row())
+
         self._state_label = QLabel("状态: 空闲")
         root.addWidget(self._state_label)
 
@@ -298,6 +305,38 @@ class MainWindow(QMainWindow):
         self._progress.setFixedHeight(8)
         root.addWidget(self._progress)
         return holder
+
+    def _build_backend_row(self) -> QHBoxLayout:
+        """输入方式一行：前台 SendInput / 后台 PostMessage + 绑定窗口。
+
+        只有「后台」需要目标窗口，所以绑定按钮默认置灰，勾上后台才可用。
+        """
+        self._background_check = QCheckBox("后台点击 (不占用鼠标)")
+        self._background_check.setToolTip(
+            "勾选后点击通过 PostMessage 投递给目标窗口，不会移动系统光标，"
+            "运行期间可以正常用鼠标，也不要求目标窗口在前台。\n\n"
+            "代价：只对处理 WM_* 消息的经典 Win32 窗口有效——Chromium/Electron、"
+            "游戏、部分 UWP 会忽略投递进来的消息（表现为「点了没反应」）。"
+        )
+        self._background_check.toggled.connect(self._on_backend_mode_changed)
+
+        self._bind_button = QPushButton("绑定窗口")
+        self._bind_button.setToolTip(
+            "点一下，然后在屏幕上点击目标窗口，把它设为后台点击的目标。\n"
+            "不绑定也能用：会按每次点击的坐标临时识别当时最顶层的窗口。"
+        )
+        self._bind_button.setEnabled(False)
+        self._bind_button.clicked.connect(self._bind_window)
+
+        self._bind_label = QLabel()
+        self._bind_label.setStyleSheet("color: #9aa4b2;")
+
+        row = QHBoxLayout()
+        row.addWidget(self._background_check)
+        row.addWidget(self._bind_button)
+        row.addWidget(self._bind_label, 1)
+        self._refresh_bind_label()
+        return row
 
     # ================================================================ 子系统
     def _setup_controllers(self, backend: InputBackend, store: ProfileStore | None) -> None:
@@ -408,6 +447,16 @@ class MainWindow(QMainWindow):
         # 未保存的改动先落盘，避免辛苦编辑的内容丢掉
         self.save_current(silent=True)
 
+        # 按界面选择决定这次用前台还是后台注入。
+        # 必须在 start 之前：引擎在运行中不允许换后端。
+        backend = self._active_backend()
+        self._run.set_backend(backend)
+        if backend is self._background_backend:
+            if backend.bound_window:
+                self.log_append.emit(f"[后台点击] 目标窗口：{backend.bound_title}")
+            else:
+                self.log_append.emit("[后台点击] 未绑定窗口，将按每次点击的坐标临时识别窗口")
+
         if self._minimize_check.isChecked():
             self.hide()
 
@@ -483,6 +532,72 @@ class MainWindow(QMainWindow):
         else:
             self.log_append.emit("[提示] 该步骤没有「坐标」可写，已忽略")
 
+    # ================================================================ 输入方式
+    def _ensure_background_backend(self):
+        """按需创建后台后端。延迟创建是为了不开后台模式时不碰这些 Win32 消息。"""
+        if self._background_backend is None:
+            from ..input.postmessage import PostMessageBackend
+
+            self._background_backend = PostMessageBackend()
+        return self._background_backend
+
+    def _active_backend(self):
+        """按界面上的选择返回本次运行要用的后端。"""
+        if self._background_check.isChecked():
+            return self._ensure_background_backend()
+        return self._foreground_backend
+
+    @Slot(bool)
+    def _on_backend_mode_changed(self, enabled: bool) -> None:
+        if enabled:
+            self.log_append.emit(
+                "[提示] 已切换到后台点击（PostMessage）：不移动光标、不要求目标窗口在前台；"
+                "建议先点「绑定窗口」选定目标，否则按每次点击的坐标临时识别窗口。"
+            )
+        else:
+            self.log_append.emit("[提示] 已切回前台点击（SendInput）")
+        self._refresh_bind_label()
+        self._sync_backend_controls()
+
+    def _refresh_bind_label(self) -> None:
+        if not self._background_check.isChecked():
+            self._bind_label.setText("默认：前台注入（SendInput）")
+            return
+        backend = self._background_backend
+        if backend is not None and backend.bound_window:
+            self._bind_label.setText(f"目标窗口：{backend.bound_title}")
+        else:
+            self._bind_label.setText("未绑定（将按点击坐标自动识别窗口）")
+
+    def _sync_backend_controls(self) -> None:
+        """按「是否在跑 / 是否在录」刷新这一行控件的可用性。"""
+        busy = self._run.running or self._record.recording
+        self._background_check.setEnabled(not busy)
+        self._bind_button.setEnabled(self._background_check.isChecked() and not busy)
+
+    @Slot()
+    def _bind_window(self) -> None:
+        """走一次取点流程，把屏幕上点到的那个窗口设为后台点击目标。"""
+        if self._run.running or self._record.recording:
+            self.log_append.emit("[提示] 任务运行或录制中，请结束后再绑定窗口")
+            return
+        if self._picker.busy:
+            self.log_append.emit("[提示] 正在拾取坐标，请先完成或按 Esc 取消")
+            return
+        self._picker.request(
+            self._bind_window_at,
+            on_canceled=lambda: self.log_append.emit("已取消绑定窗口"),
+            hide_widget=self,
+        )
+
+    def _bind_window_at(self, x: int, y: int) -> None:
+        backend = self._ensure_background_backend()
+        if backend.bind_point(x, y):
+            self.log_append.emit(f"已绑定目标窗口：{backend.bound_title}")
+        else:
+            self.log_append.emit(f"[错误] 坐标 ({x}, {y}) 处没有可用的窗口，绑定失败")
+        self._refresh_bind_label()
+
     # ================================================================ 跨界状态
     @Slot()
     def _reset_control_buttons(self) -> None:
@@ -491,6 +606,8 @@ class MainWindow(QMainWindow):
         录制和回放都会禁用「开始/拾取/录制」，只有同时了解两边的这里才判断得了，
         因此这几个按钮留在 MainWindow，不下放到控制器里。
         """
+        self._sync_backend_controls()
+
         if self._record.recording:
             self._start_button.setEnabled(False)
             self._pick_button.setEnabled(False)
@@ -610,4 +727,6 @@ class MainWindow(QMainWindow):
 
         self._log_panel.detach()
         self._picker.cancel()
+        if self._background_backend is not None:
+            self._background_backend.close()
         self._tray.hide()
