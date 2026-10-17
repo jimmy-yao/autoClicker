@@ -1,0 +1,8 @@
+# 行尾完全由本文件决定，不跟随各机器上的 core.autocrlf。
+# 本机系统级 core.autocrlf=true，若不加这层约束，克隆下来的 .py 会变成 CRLF，
+# 与 bootstrap.py 内嵌的快照（LF）不一致，--sync 会莫名其妙地把 41 个文件全改一遍。
+* text=auto eol=lf
+
+# 例外：cmd.exe 解析多行 if ( ... ) / for 以及续行 ^ 时依赖 CRLF，
+# 行尾被改成 LF 会直接解析错乱。必须锁定。
+*.bat text eol=crlf
