@@ -409,7 +409,7 @@ class TestBackendOnRealWindows(_WindowTestCaseMixin, unittest.TestCase):
         self.assertEqual(
             child.mouse_messages,
             [WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP],
-            f"子窗口应依次收到移动/按下/抬起；实际收到 {child.messages!r}",
+            f"子窗口应依次收到移动/按下/抬起；实际收到 {child.mouse_messages!r}",
         )
         self.assertEqual(self.top.mouse_records, [], "消息应直接投给子窗口，不该发给父窗口")
 
@@ -447,7 +447,10 @@ class TestBackendOnRealWindows(_WindowTestCaseMixin, unittest.TestCase):
         backend.click(30 + 25, 30 + 35, MouseButton.LEFT)
         _flush()
 
-        self.assertEqual(hidden.messages, [], "不可见子窗口不该收到任何消息")
+        # 注意：不能断言 hidden.messages 为空——CreateWindowEx 本身就会给窗口送去
+        # WM_NCCREATE / WM_NCCALCSIZE / WM_CREATE / WM_SIZE / WM_MOVE。
+        # 这里要排除的是「点击」，所以只过滤鼠标消息。
+        self.assertEqual(hidden.mouse_records, [], "不可见子窗口不该收到任何鼠标消息")
         self.assertEqual(
             self.top.mouse_messages, [WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP]
         )
