@@ -1,0 +1,121 @@
+name: Windows 验证
+
+# 为什么必须在 Windows runner 上跑
+# --------------------------------
+# app/win/* 在 import 阶段就调 ctypes.WinDLL，Linux/macOS 上整套逻辑连 import 都过不去；
+# 唯一一处「真的建窗口、真的投消息」的验证（tests/test_win_integration.py）更是只能在
+# Windows 上执行。所以这套 CI 没有别的选择。
+#
+# 仓库公开，GitHub Actions 对公开仓库不计分钟，Windows runner 双倍计费在这里不花钱。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- 快照一致性
+  snapshot:
+    name: 内嵌快照与仓库一致
+    # 纯粹的文件读写，不需要 Windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 生成一份并逐字节比对
+        run: |
+          python bootstrap.py "$RUNNER_TEMP/generated" >/dev/null
+          python - "$RUNNER_TEMP/generated" <<'PY'
+          import sys
+          from pathlib import Path
+
+          generated = Path(sys.argv[1])
+          repo = Path.cwd()
+          ignore = {".git", "__pycache__", ".pytest_cache"}
+
+          def collect(root):
+              found = {}
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  rel = path.relative_to(root)
+                  if any(part in ignore for part in rel.parts):
+                      continue
+                  found[rel.as_posix()] = path
+              return found
+
+          want = collect(generated)
+          have = collect(repo)
+          have.pop("bootstrap.py", None)  # 生成器自己不进快照
+
+          problems = []
+          for name in sorted(set(want) | set(have)):
+              if name not in have:
+                  problems.append(f"快照里有、仓库里没有: {name}")
+              elif name not in want:
+                  problems.append(f"仓库里有、快照里没有: {name}")
+              elif want[name].read_bytes() != have[name].read_bytes():
+                  problems.append(f"内容不一致: {name}")
+
+          if problems:
+              print("内嵌快照与仓库不一致：")
+              for line in problems:
+                  print("  -", line)
+              print()
+              print("修法：在仓库根目录跑 `python bootstrap.py --sync`，然后提交改动。")
+              sys.exit(1)
+
+          print(f"内嵌快照与仓库逐字节一致（{len(want)} 个文件）")
+          PY
+
+  # ---------------------------------------------------------------- 真实窗口
+  integration:
+    name: 后台点击集成测试（真实 Win32 窗口）
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 环境信息
+        run: python -c "import platform, sys; print(sys.version); print(platform.platform())"
+
+      - name: 跑集成测试
+        # 不需要 PySide6：这个文件只碰 ctypes 与 app.win / app.input 里两个纯 Win32 模块
+        run: python tests/test_win_integration.py
+
+  # ---------------------------------------------------------------- 冒烟
+  smoke:
+    name: 冒烟测试（Qt offscreen）
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 跑冒烟测试
+        run: python tests/test_smoke.py

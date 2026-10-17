@@ -1,5 +1,7 @@
 # AutoClicker · Windows 10 自动点击器
 
+[![Windows 验证](https://github.com/jimmy-yao/autoClicker/actions/workflows/windows.yml/badge.svg)](https://github.com/jimmy-yao/autoClicker/actions/workflows/windows.yml)
+
 基于 **Python 3 + PySide6** 的桌面自动化工具，输入注入走 Win32 `SendInput`，
 不依赖任何第三方输入库。
 
@@ -463,7 +465,11 @@ python tests\test_win_integration.py # 18 个用例，只认 Windows（其它平
 
 `test_smoke.py` 使用 Qt 的 `offscreen` 平台插件，不会真的弹窗，也不会真的点鼠标
 （引擎测试使用 `FakeBackend` + 注入的假抓屏函数，并校验完整事件时间线）。
-`test_win_integration.py` 反过来：**真的建窗口、真的投消息**，细节见本节末尾。覆盖：
+`test_win_integration.py` 反过来：**真的建窗口、真的投消息**，细节见本节末尾。
+
+两者都在 CI 上跑（`.github/workflows/windows.yml`，`windows-latest`），另外还多一个 job
+校验 `bootstrap.py` 的内嵌快照与仓库**逐字节一致**——改了文件忘记 `--sync` 是这套
+「一个文件就是一个项目」的设计特有的失效模式，交给 CI 守着比靠记性可靠。覆盖：
 
 - `INPUT` 结构体大小与联合体内存共享语义
 - 虚拟屏幕坐标读取、单实例守卫、热键键码表
@@ -522,6 +528,9 @@ python tests\test_win_integration.py # 18 个用例，只认 Windows（其它平
 
 ```
 auto-clicker/
+├─ .github/
+│  └─ workflows/
+│     └─ windows.yml           # CI：快照一致性 + 真实窗口集成测试 + 冒烟测试
 ├─ main.py                     # 入口：DPI → 日志 → QApplication → 单实例 → 装配
 ├─ requirements.txt
 ├─ build.bat                   # 一键打包（先跑冒烟测试，再 PyInstaller）
@@ -614,7 +623,7 @@ pyinstaller --noconfirm --onefile --windowed --name AutoClicker main.py
 
 ## 从零重建项目（bootstrap.py）
 
-`bootstrap.py` 把整份项目（47 个文件）硬编码在自己内部，不读任何原始文件就能还原出完整项目，
+`bootstrap.py` 把整份项目（48 个文件）硬编码在自己内部，不读任何原始文件就能还原出完整项目，
 适合打包分发「一个文件就是一个项目」：
 
 ```powershell
