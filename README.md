@@ -10,6 +10,8 @@
 - **P2** — 录制回放。
 - **P1 / P0** — 步骤序列、方案管理、热键、托盘、单实例、DPI。
 
+> 📖 面向使用者的操作说明见 [`docs/USAGE.md`](docs/USAGE.md)。
+
 ---
 
 ## 功能
@@ -468,6 +470,8 @@ auto-clicker/
 ├─ requirements.txt
 ├─ build.bat                   # 一键打包（先跑冒烟测试，再 PyInstaller）
 ├─ bootstrap.py                # 自解压式项目生成器（--sync 刷新内嵌快照）
+├─ docs/
+│  └─ USAGE.md                 # 面向使用者的操作说明（怎么用这个工具）
 ├─ app/
 │  ├─ win/                     # 平台适配（纯 ctypes）
 │  │  ├─ dpi.py                #   Per-Monitor V2 DPI 感知
@@ -551,7 +555,7 @@ pyinstaller --noconfirm --onefile --windowed --name AutoClicker main.py
 
 ## 从零重建项目（bootstrap.py）
 
-`bootstrap.py` 把整份源码（41 个文件）硬编码在自己内部，不读任何原始文件就能还原出完整项目，
+`bootstrap.py` 把整份项目（45 个文件）硬编码在自己内部，不读任何原始文件就能还原出完整项目，
 适合打包分发「一个文件就是一个项目」：
 
 ```powershell
