@@ -174,10 +174,16 @@ python main.py
 python tools\probe_background.py
 ```
 
-它会把鼠标下那个控件的**窗口链与类名**打出来并判类（`SunAwt*` / `Qt*` 通常有效，
-`Chrome_*` / `Cef*` 基本无效），列出目标进程里的 JCEF / Chromium 痕迹，最后用**项目自己的
-后台后端**真点一下。装了 `uiautomation` 的话，还会顺带看 UIA 树里有没有那个按钮
-（决定要不要走无障碍接口那条路）。详见「技术要点 · 13」。
+它**自己给结论**，不需要你去读窗口类名：跑一次会打印「路线 + 置信度 + 理由 +
+可直接照抄的方案」，并顺手把模板截好填进方案里（会把光标从按钮上挪开再截，避免拿到悬停态）：
+
+- 路线是**后台点击** → 照它给的步骤勾「后台点击」+ 绑定窗口就能跑；
+- 路线是 **UIA** → 说明 `WM_*` 这条路对你不通，但它会告诉你是「值得加 UIA 后端」还是
+  「UIA 也走不通（先去开 IDEA 的 Support screen readers / `jabswitch -enable`）」；
+- 路线是**前台** → 判不出来时的保守选择，前台一定有效，只是会占用鼠标。
+
+加 `--save 继续续跑` 可以直接把方案写进 `%LOCALAPPDATA%\AutoClicker\profiles\`，不用手抄 JSON。
+装了 `uiautomation` 的话还会顺带测 UIA 那条路。判定依据与优先级见「技术要点 · 14」。
 
 ### 热键
 
@@ -419,8 +425,32 @@ python tools\probe_background.py
 还有一条是「伪后台」：保存光标 → `SetCursorPos` + `SendInput` 点击 → 还原光标。看着几乎不打扰，
 但只要光标和焦点被抢走，你就没法同时用别的窗口——它不是真正的后台。
 
-**先自检，再决定。** `tools/probe_background.py` 会在目标程序上打出窗口类名、JCEF 痕迹，
-并用项目自己的后端真点一下，把上面这张表落到你的具体程序上。
+**先自检，再决定。** `tools/probe_background.py` 把上面这张表落到你的具体程序上：
+它自己给结论（三条路里选一条 + 置信度 + 理由），并顺手生成能直接用的方案。判定怎么做到的，
+见下一条。
+
+### 14. 探针怎么「自动判断」：四路证据按可信度合议
+
+探针不靠猜，把证据按可信度排了个序，先命中的说了算：
+
+| 优先级 | 证据 | 为什么可信 |
+|---|---|---|
+| 1 | **实测**：真投一记 `WM_LBUTTONDOWN/UP`，比对点击前后那块屏幕的像素 | 唯一的直接经验证据。「有变化」是强证据，「没变化」只是弱证据（按钮按下可能只闪一下） |
+| 2 | **窗口链里有 Chromium/CEF** | 决定性判据。有它 → 这个按钮是网页画的，`WM_*` 一定被渲染器丢掉，**与外面套的是 Swing 还是 Qt 无关** |
+| 3 | **框架类名** | `SunAwt*` / `Qt*` / `WindowsForms*` / `HwndWrapper*` 通常认 `WM_*`；`ApplicationFrameWindow`(UWP) / WinUI 不认 |
+| 4 | **UIA** | 光标下的元素支不支持 `InvokePattern`、树里找不找得到那个按钮 —— 决定「值不值得加 UIA 后端」 |
+
+两个刻意的设计：
+
+- **Chromium 优先于框架**。IDEA 主窗口类是 `SunAwtFrame`（Swing，看着很乐观），
+  但 JCEF 面板的按钮实际由 `Chrome_RenderWidgetHostHWND` 画——只按顶层类名判会得出完全相反的
+  结论。所以窗口链里只要有 Chromium，就直接改判，实测「有变化」也不翻盘（网页里焦点/悬停的
+  副作用同样会让画面变）。
+- **测之前先确认那块区域自己不会变**。点击前连拍两帧比对，不一致就说明那里有动画/光标闪烁，
+  实测结果标为「不可信」，退回按框架判定 —— 免得把动画当成「点击生效了」。
+
+判不出来时（既没识别出框架、也没实测）给的是**前台**，不是后台：前台 `SendInput` 一定有效，
+是唯一安全的默认。宁可推荐一条笨但能用的路，也不推一条可能白折腾的路。
 
 ---
 
@@ -456,18 +486,22 @@ python tools\probe_background.py
 
 ## 测试
 
-两套测试，按「要不要真实的 Windows 消息循环」分开：
+三套测试，按「跑起来需要什么」分开：
 
 ```powershell
-python tests\test_smoke.py           # 139 个用例，任何平台都能跑
+python tests\test_smoke.py           # 139 个用例，需要 PySide6，任何平台都能跑
 python tests\test_win_integration.py # 18 个用例，只认 Windows（其它平台自动 skip）
+python tests\test_probe.py           # 41 个用例，零依赖，任何平台都能跑
 ```
 
 `test_smoke.py` 使用 Qt 的 `offscreen` 平台插件，不会真的弹窗，也不会真的点鼠标
 （引擎测试使用 `FakeBackend` + 注入的假抓屏函数，并校验完整事件时间线）。
 `test_win_integration.py` 反过来：**真的建窗口、真的投消息**，细节见本节末尾。
+`test_probe.py` 测的是**探针的判定规则**——那部分是纯函数，所以它反过来是唯一一套
+连 PySide6 都不需要的测试（`probe_background.py` 对 `ctypes.WinDLL` 做了保护，
+非 Windows 上依然能 import）。把「JCEF 判成能后台点」这类会把用户带沟里的结论钉死在用例里。
 
-两者都在 CI 上跑（`.github/workflows/windows.yml`，`windows-latest`），另外还多一个 job
+三套都在 CI 上跑（`.github/workflows/windows.yml`），另外还多一个 job
 校验 `bootstrap.py` 的内嵌快照与仓库**逐字节一致**——改了文件忘记 `--sync` 是这套
 「一个文件就是一个项目」的设计特有的失效模式，交给 CI 守着比靠记性可靠。覆盖：
 
@@ -510,6 +544,11 @@ python tests\test_win_integration.py # 18 个用例，只认 Windows（其它平
   点击真的由目标窗口收到（`WM_MOUSEMOVE → 按下 → 抬起`，`lParam` 是正确的客户区坐标）、
   右键分支、只投 `WM_MOUSEMOVE` 的移动、后台键盘的按键与扫描码、按点绑定归一化到顶层窗口、
   失效句柄拒绝绑定
+- **探针的判定规则**（`test_probe.py`）：框架类名表（Chromium / Swing / Qt / WPF / WinForms /
+  UWP / WinUI / 经典控件 / 认不出）、**Chromium 压过外层框架**、四路证据合议出的每条路线与置信度、
+  判不出来时退回前台、结论必须给理由、截图区域在屏幕内被正确夹取（含负原点多屏）、
+  模板质检（纯色 / 两种色 / 99% 单色 → 差）、挪开光标的落点不越界，
+  以及最要紧的一条：**生成的方案能被 `Profile.from_dict()` 读回并通过 `validate()`**
 
 `SendInput` 注入与 GDI 抓屏这两层不做自动化断言，改为真机联调验证（抓一帧 → 抠一块当模板 →
 必须一次命中且坐标精确、通道差为 0）。
@@ -520,7 +559,9 @@ python tests\test_win_integration.py # 18 个用例，只认 Windows（其它平
 `PostMessageBackend` 的实现细节在自动化测试里就有断言守着，而不是只能靠肉眼。
 
 真机仍无法被替代的只剩一件事：**目标程序认不认 `WM_*`**。这取决于对方是什么框架，用
-`tools\probe_background.py` 现场判定（见「后台点击」一节）。
+`tools\probe_background.py` 跑一次就能拿到结论（它会自己判定并生成方案，见「后台点击」一节）；
+而判定规则本身是有测试守着的（`test_probe.py`），因为判错方向的代价是让用户拿着一份跑不通的
+方案来回折腾。
 
 ---
 
@@ -538,7 +579,7 @@ auto-clicker/
 ├─ docs/
 │  └─ USAGE.md                 # 面向使用者的操作说明（怎么用这个工具）
 ├─ tools/
-│  └─ probe_background.py      # 后台点击自检探针（判定目标程序适不适合 PostMessage / UIA）
+│  └─ probe_background.py      # 后台点击自检探针（自动判定走 PostMessage / UIA / 前台，并生成方案）
 ├─ app/
 │  ├─ win/                     # 平台适配（纯 ctypes）
 │  │  ├─ dpi.py                #   Per-Monitor V2 DPI 感知
@@ -577,8 +618,9 @@ auto-clicker/
 │  └─ utils/
 │     └─ logger.py             # 滚动文件日志 + 转发给 UI 的 handler
 └─ tests/
-   ├─ test_smoke.py
-   └─ test_win_integration.py     # 真实 Win32 窗口上的后台点击集成测试（仅 Windows）
+   ├─ test_smoke.py              # 139 个用例：结构体 / 匹配 / 引擎 / 录制 / 钩子 / UI / 后台点击
+   ├─ test_win_integration.py    # 真实 Win32 窗口上的后台点击集成测试（仅 Windows）
+   └─ test_probe.py              # 探针判定规则（纯逻辑，零依赖，任何平台都能跑）
 ```
 
 ---
@@ -623,7 +665,7 @@ pyinstaller --noconfirm --onefile --windowed --name AutoClicker main.py
 
 ## 从零重建项目（bootstrap.py）
 
-`bootstrap.py` 把整份项目（48 个文件）硬编码在自己内部，不读任何原始文件就能还原出完整项目，
+`bootstrap.py` 把整份项目（49 个文件）硬编码在自己内部，不读任何原始文件就能还原出完整项目，
 适合打包分发「一个文件就是一个项目」：
 
 ```powershell

@@ -19,10 +19,19 @@ echo  AutoClicker Build
 echo ============================================
 
 echo [1/4] Running smoke tests ...
+REM errorlevel only reflects the LAST command, so each suite is checked
+REM separately - otherwise a fast-failing smoke test hides behind this one.
 python tests\test_smoke.py
 if errorlevel 1 (
     echo.
     echo [ERROR] Smoke tests failed - not building a broken exe
+    pause
+    exit /b 1
+)
+python tests\test_probe.py
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Probe tests failed - not building a broken exe
     pause
     exit /b 1
 )
