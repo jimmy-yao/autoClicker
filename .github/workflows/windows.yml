@@ -180,6 +180,11 @@ jobs:
         # 「PyInstaller 退出码是 0」只说明它把文件拼出来了，不说明这东西能跑——
         # 少一个隐藏 import 的经典表现就是「打得出、一开就退」。
         # 这里把它真的拉起来，等它写出日志文件，确认它没在启动过程中死掉。
+        #
+        # 预期内的噪音：runner 是无头环境（offscreen、没有 Explorer shell），
+        # 所以日志里会有 app.ui.tray_icon 那句「系统托盘不可用」的 WARNING——
+        # 那是托盘按设计退化成空壳（见 app/ui/tray_icon.py 的模块说明），
+        # 不是打包的问题；真机上有托盘时走的是另一条分支。
         run: |
           # 先清掉可能残留的用户数据，下面才好在「有没有新日志」上做判断
           Remove-Item -Recurse -Force "$env:LOCALAPPDATA\AutoClicker" -ErrorAction SilentlyContinue
@@ -208,8 +213,22 @@ jobs:
           }
           Stop-Process -Id $exeProcess.Id -Force
 
-          "启动正常，日志开头："
-          Get-Content $log -TotalCount 3
+          $lines = Get-Content $log
+
+          # 打全文，不打前几行：不然第 3 行之后有什么就只能靠猜
+          "启动正常，日志全文（$($lines.Count) 行）："
+          $lines
+
+          # 进程还活着不代表装配没问题：出错被吞掉、降级继续跑也是一种失败方式。
+          # 所以反过来把 ERROR/CRITICAL 当作硬判据。
+          $errors = $lines | Where-Object { $_ -match '\[(ERROR|CRITICAL)' }
+          if ($errors) {
+              $errors
+              throw "exe 日志里出现了 ERROR / CRITICAL（上面是原文）"
+          }
+
+          $warnings = @($lines | Where-Object { $_ -match '\[WARNING' })
+          "（WARNING $($warnings.Count) 条，都在上面；无头环境的托盘那条是预期的）"
 
       - uses: actions/upload-artifact@v4
         with:
