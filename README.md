@@ -366,6 +366,21 @@ UIA 不看像素、也不投消息，而是**按控件办事**：拿坐标去问
 为什么要**隐藏**请求方而不是仅靠遮罩盖在上面：Qt 的**模态**对话框会拦截其它窗口的输入，
 而隐藏的模态窗口不参与输入拦截，遮罩才能正常接到鼠标点击。
 
+**但「隐藏请求方」会撞上 Qt 的一处语义陷阱**：`QDialog::setVisible(false)` 会主动退出
+`exec()` 起的模态循环（qdialog.cpp 里的原话：「Reimplemented to exit a modal event loop
+when the dialog is hidden」）。步骤编辑对话框正好是 `exec()` 打开的，而它上面的
+「拾取坐标 / 截取屏幕 / 模拟测试」三个按钮都要先把自己 `hide()` 掉让开——用 `exec()` 的话，
+**点一下就等于按了取消**：`exec()` 立刻返回 `Rejected`，这一步被丢掉；等用户拖完框，
+对话框又因为只剩拾取器一个引用、引用一断就被销毁，表现成「窗口自己关掉了」。
+
+所以 `StepEditor._open_dialog` 不用 `exec()`，而是自己起一个 `QEventLoop`，只在真正的
+accept / reject（`finished`）时退出，中间被 `hide()` / `show()` 多少次都不受影响；
+另接一个 `destroyed` 兜底，免得对话框在流程中被销毁时这个循环永远挂着。
+
+同一处还有个不变式：**抓屏失败也必须把请求方还回去**。`_capture_template` /
+`_capture_full` 里的 `_restore()` 写在 `finally` 里——漏掉它的症状是「窗口再也回不来，
+而且此后所有拾取都被 `busy` 挡回去」，比抓屏失败本身难查得多。
+
 ### 8. 坐标拾取器的双坐标系
 
 - **视觉布局**用 Qt 逻辑坐标（所有 `QScreen.geometry()` 的并集），保证多显示器时贴合；
@@ -579,7 +594,7 @@ COM 在 Python 里的麻烦之处在于**虚表下标**：`IUIAutomation` 的方
 四套测试，按「跑起来需要什么」分开：
 
 ```powershell
-python tests\test_smoke.py           # 139 个用例，需要 PySide6，任何平台都能跑
+python tests\test_smoke.py           # 141 个用例，需要 PySide6；只认 Windows（app\win\* 在 import 阶段就要绑 DLL）
 python tests\test_win_integration.py # 18 个用例，只认 Windows（其它平台自动 skip）
 python tests\test_probe.py           # 52 个用例，零依赖，任何平台都能跑
 python tests\test_uia.py             # 82 个用例，零依赖，任何平台都能跑（其中 4 个真 COM 用例只认 Windows）
@@ -747,7 +762,7 @@ auto-clicker/
 │  └─ utils/
 │     └─ logger.py             # 滚动文件日志 + 转发给 UI 的 handler
 └─ tests/
-   ├─ test_smoke.py              # 139 个用例：结构体 / 匹配 / 引擎 / 录制 / 钩子 / UI / 三种后端
+   ├─ test_smoke.py              # 141 个用例：结构体 / 匹配 / 引擎 / 录制 / 钩子 / UI / 三种后端
    ├─ test_win_integration.py    # 18 个用例：真实 Win32 窗口上的后台点击（仅 Windows）
    ├─ test_probe.py              # 52 个用例：探针判定规则（纯逻辑，零依赖，任何平台都能跑）
    └─ test_uia.py                # 82 个用例：UIA 后端与 COM 调用层（零依赖）+ 4 个真 COM 自检（仅 Windows）
