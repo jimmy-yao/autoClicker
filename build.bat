@@ -10,9 +10,15 @@ REM  NOTE 1: this file must keep CRLF line endings. cmd.exe mis-parses
 REM          multi-line blocks (if / for ... ) that use bare LF.
 REM  NOTE 2: all console output is kept ASCII on purpose - the OEM code page
 REM          on a Chinese Windows is GBK, and mixing encodings garbles it.
+REM  NOTE 3: HOLD is `pause` when a human runs this, and `rem` in CI.
+REM          GitHub Actions sets CI=true, and a bare `pause` there would
+REM          swallow no input and just sit until the job times out.
 REM ===========================================================================
 
 cd /d "%~dp0"
+
+set "HOLD=pause"
+if defined CI set "HOLD=rem"
 
 echo ============================================
 echo  AutoClicker Build
@@ -25,14 +31,14 @@ python tests\test_smoke.py
 if errorlevel 1 (
     echo.
     echo [ERROR] Smoke tests failed - not building a broken exe
-    pause
+    %HOLD%
     exit /b 1
 )
 python tests\test_probe.py
 if errorlevel 1 (
     echo.
     echo [ERROR] Probe tests failed - not building a broken exe
-    pause
+    %HOLD%
     exit /b 1
 )
 
@@ -40,7 +46,7 @@ python tests\test_uia.py
 if errorlevel 1 (
     echo.
     echo [ERROR] UIA tests failed - not building a broken exe
-    pause
+    %HOLD%
     exit /b 1
 )
 echo.
@@ -49,13 +55,13 @@ python -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] PyInstaller is not installed for this python
     echo         Run: python -m pip install pyinstaller
-    pause
+    %HOLD%
     exit /b 1
 )
 
 if not exist main.py (
     echo [ERROR] main.py not found - run this script from the project root
-    pause
+    %HOLD%
     exit /b 1
 )
 
@@ -120,14 +126,14 @@ python -m PyInstaller ^
 if errorlevel 1 (
     echo.
     echo [ERROR] Build failed
-    pause
+    %HOLD%
     exit /b 1
 )
 
 if not exist dist\AutoClicker.exe (
     echo.
     echo [ERROR] PyInstaller reported success but dist\AutoClicker.exe is missing
-    pause
+    %HOLD%
     exit /b 1
 )
 
@@ -139,4 +145,4 @@ echo Output: dist\AutoClicker.exe  (%EXE_SIZE% bytes)
 echo.
 echo Reminder: profiles and logs live in %%LOCALAPPDATA%%\AutoClicker,
 echo           so replacing the exe never loses user settings.
-pause
+%HOLD%

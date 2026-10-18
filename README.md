@@ -603,9 +603,12 @@ COM 那层对 `WinDLL` 做了保护，假客户端顶掉真实 UIA 调用，只�
 校验 `bootstrap.py` 的内嵌快照与仓库**逐字节一致**——改了文件忘记 `--sync` 是这套
 「一个文件就是一个项目」的设计特有的失效模式，交给 CI 守着比靠记性可靠。
 
-CI 分三个 job 也是按同一原则：`static`（ubuntu）跑探针判定与 UIA 的**纯逻辑**；
+CI 分四个 job 也是按同一原则：`static`（ubuntu）跑探针判定与 UIA 的**纯逻辑**；
 `integration`（windows）跑真实窗口集成测试，**外加 `test_uia.py` 里那 4 个真 COM 用例**
-（手写的虚表下标只有真的调一次才能证明没写错）；`smoke`（windows，需要 PySide6）跑界面那套。
+（手写的虚表下标只有真的调一次才能证明没写错）；`smoke`（windows，需要 PySide6）跑界面那套；
+`build`（windows）**把 exe 真的打出来**——它跑的就是用户双击的那个 `build.bat`（所以那几套
+测试在这里跑了第二遍，换来的是「用户拿到的那条路径」被真的走一遍），打完之后还会**把 exe
+真启动一次**并等它写出日志，最后把产物传成 artifact 供下载。
 覆盖：
 
 - `INPUT` 结构体大小与联合体内存共享语义
@@ -692,10 +695,10 @@ Invoke 的控件**。两者都取决于对方是什么程序，用 `tools\probe_
 auto-clicker/
 ├─ .github/
 │  └─ workflows/
-│     └─ windows.yml           # CI：快照一致性 + 真实窗口集成测试 + 冒烟测试
+│     └─ windows.yml           # CI：快照一致性 / 真实窗口集成 / 冒烟 / 打出 exe 并启动一次
 ├─ main.py                     # 入口：DPI → 日志 → QApplication → 单实例 → 装配
 ├─ requirements.txt
-├─ build.bat                   # 一键打包（先跑冒烟测试，再 PyInstaller）
+├─ build.bat                   # 一键打包（先跑三套测试，再 PyInstaller；CI 里也用它）
 ├─ bootstrap.py                # 自解压式项目生成器（--sync 刷新内嵌快照）
 ├─ docs/
 │  └─ USAGE.md                 # 面向使用者的操作说明（怎么用这个工具）
@@ -752,11 +755,16 @@ auto-clicker/
 ## 打包
 
 双击 `build.bat`（或命令行里跑 `build.bat`）即可。它会按顺序做四件事：
-先跑一遍冒烟测试、真实窗口集成测试、探针判定、UIA 后端四套测试
-（**任何一套不过就不打包**，避免打出一个坏 exe），清掉旧的 `build\`、`dist\`，
+先跑一遍测试——**冒烟（`test_smoke.py`）、探针判定（`test_probe.py`）、UIA 后端（`test_uia.py`）**
+三套（**任何一套不过就不打包**，避免打出一个坏 exe），清掉旧的 `build\`、`dist\`，
 再调 PyInstaller，最后报告产物路径与体积。
+（真实窗口那套 `test_win_integration.py` 不在这里跑：它要真的建窗口，本地打包时窗口会闪；
+CI 的 `integration` job 专门跑它。）
 
 产物：`dist\AutoClicker.exe`，单文件、无控制台窗口。
+
+> 不想在本机装 PyInstaller 的话：CI 每次推送到 `main` 都会打一次包，产物作为
+> **`AutoClicker-exe`** artifact 挂在运行记录里，可以直接下载（保留 14 天）。详见「测试」一节末尾。
 
 ```powershell
 :: 需要先装 PyInstaller（build.bat 会检查并提示）
