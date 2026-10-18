@@ -35,6 +35,14 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+python tests\test_uia.py
+if errorlevel 1 (
+    echo.
+    echo [ERROR] UIA tests failed - not building a broken exe
+    pause
+    exit /b 1
+)
 echo.
 
 python -m PyInstaller --version >nul 2>&1

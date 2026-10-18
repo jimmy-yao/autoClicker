@@ -41,3 +41,10 @@ class InputBackend(ABC):
 
     def close(self) -> None:
         """释放后端占用的资源（默认无操作）。"""
+
+    def reset_notices(self) -> None:
+        """每次开始运行之前被调用一次，用于重置「只提示一次」的标记。
+
+        UI 在 ``start`` 之前会调用。依赖它的后端（比如 UIA）因此能保证关键提示
+        **每次运行都看得到**，而同一个宏里的成百上千次点击不会把日志刷爆。
+        """

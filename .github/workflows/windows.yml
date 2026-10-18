@@ -2,12 +2,15 @@ name: Windows 验证
 
 # 三个 job，按「跑起来需要什么」分
 # -------------------------------
-# · static（ubuntu）：快照一致性与探针判定逻辑，都是纯文件读写 / 纯函数，不需要 Windows。
+# · static（ubuntu）：快照一致性、探针判定逻辑、UIA 后端的逻辑 —— 都是纯文件读写 / 纯函数，
+#   不需要 Windows。
 # · integration（windows）：tests/test_win_integration.py —— 唯一一处「真的建窗口、真的投
 #   消息」的验证，只能在 Windows 上执行。
 # · smoke（windows）：tests/test_smoke.py，需要 PySide6，用 Qt 的 offscreen 平台插件。
 #
-# app/win/* 在 import 阶段就调 ctypes.WinDLL，所以带界面的那两套测试**只能**在 Windows 上跑。
+# app/win/* 里带 DLL 绑定的那几个在 import 阶段就调 ctypes.WinDLL，所以带界面的那两套测试
+# **只能**在 Windows 上跑。UIA 那两层特意做成了「非 Windows 也能 import」，因此它的逻辑
+# 能在 ubuntu 上真跑（见 static job）。
 # 仓库公开，GitHub Actions 对公开仓库不计分钟，Windows runner 双倍计费在这里不花钱。
 
 on:
@@ -23,8 +26,8 @@ concurrency:
 jobs:
   # ---------------------------------------------------------------- 静态检查
   static:
-    name: 静态检查（快照一致性 / 探针判定逻辑）
-    # 这一组不需要 Windows：快照是纯文件读写，探针判定是纯函数
+    name: 静态检查（快照一致性 / 探针判定 / UIA 逻辑）
+    # 这一组不需要 Windows：快照是纯文件读写，UIA 层的逻辑也刻意做成了跨平台可跑
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -36,6 +39,11 @@ jobs:
 
       - name: 探针判定逻辑（test_probe.py）
         run: python tests/test_probe.py
+
+      - name: UIA 后端逻辑（test_uia.py）
+        # 不需要 Windows，也不需要 PySide6：COM 那层对 WinDLL 做了保护，
+        # 假客户端负责顶掉真实的 UIA 调用
+        run: python tests/test_uia.py
 
       - name: 生成一份并逐字节比对
         run: |
@@ -101,6 +109,12 @@ jobs:
       - name: 跑集成测试
         # 不需要 PySide6：这个文件只碰 ctypes 与 app.win / app.input 里两个纯 Win32 模块
         run: python tests/test_win_integration.py
+
+      - name: 跑 UIA 逻辑与真 COM 自检（test_uia.py）
+        # 非 Windows 上这个文件里的纯逻辑部分在 static job 已经跑过；
+        # 这里多跑的是「真的 CoCreateInstance / ElementFromPoint」那几例——
+        # 手写的虚表下标只有真的调一次才能证明没写错。同样不需要 PySide6。
+        run: python tests/test_uia.py
 
   # ---------------------------------------------------------------- 冒烟
   smoke:

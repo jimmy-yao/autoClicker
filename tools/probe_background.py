@@ -13,8 +13,8 @@
 三选一的结论
 ------------
 - ``后台点击（PostMessage）``：本项目现有的「后台点击」就能用，不占鼠标。
-- ``UIA（无障碍接口）``：PostMessage 没戏，得走 UI Automation。**本项目目前没有这个后端**
-  （需要新增），脚本会说明是「值得加」还是「这条路也走不通」。
+- ``UIA 无障碍（按控件 Invoke）``：PostMessage 没戏（网页控件），但 UIA 走得通——
+  本项目已内置这个后端，界面上的「输入方式」里选它即可。
 - ``前台点击（SendInput）``：一定有效，但执行期间占用鼠标、目标区域必须显示在屏幕上。
 
 判定依据（按可信度从高到低）
@@ -22,11 +22,15 @@
 1. **实测**：真的投一记 ``WM_LBUTTONDOWN/UP``，再比对点击前后那一小块屏幕的像素。
    这是唯一直接的经验证据。为了不被界面自身的动画骗到，点击前先连拍两帧确认该区域稳定。
 2. **关键结构**：坐标所在窗口链里有没有 Chromium/CEF 窗口。有 → 这个按钮是网页画的，
-   ``WM_*`` 一定会被渲染器丢掉（JCEF/Electron 的固有行为）。这是决定性判据。
+   ``WM_*`` 一定会被渲染器丢掉（JCEF/Electron 的固有行为）。这是决定性判据，**比「像素变了」
+   还硬**：网页里焦点/悬停的副作用也会让像素变，拿它反推「点到了」会误判。
 3. **框架类名**：``SunAwt*`` / ``Qt*`` / ``WindowsForms*`` / ``HwndWrapper*`` 通常认 ``WM_*``；
    ``ApplicationFrameWindow``(UWP) / ``WinUIDesktopWin32WindowClass``(WinUI3) 不认。
-4. **UIA**：UIA 树里能不能找到这个按钮、支不支持 ``InvokePattern``
-   ——决定「值不值得给项目加一个 UIA 后端」。
+4. **UIA**：坐标下的控件（或它的某个祖先）支不支持 ``InvokePattern``——决定「中路」通不通。
+   用的是项目自己的 UIA 层（``app/win/uia.py``），和界面里选 UIA 模式时**完全同一条路**。
+
+PostMessage 没测出变化时，脚本会**接着用 UIA 真 Invoke 一记**再比对一次像素——
+「后台点了没反应」之后最该问的就是这个问题，答案直接决定要不要换成 UIA 模式。
 
 顺带做的一件事：**自动截模板**。脚本会把光标从按钮上移开、等界面重绘，再截一小块，
 把编码后的模板直接填进下面的方案里——所以打印出的配置是**能直接用的**，不用你再截一次图。
@@ -44,7 +48,7 @@
     python tools\\probe_background.py --crop 120 40       # 指定模板截取尺寸，默认 96x36
     python tools\\probe_background.py --save 继续续跑      # 把方案直接写进 profiles\\
 
-只依赖标准库；UIA 那一节要 ``pip install uiautomation``（没装就跳过，不影响其它结论）。
+只依赖标准库 + 本项目自己的代码（UIA 那一节也不再需要 ``pip install uiautomation``）。
 """
 
 from __future__ import annotations
@@ -71,7 +75,7 @@ ROUTE_FOREGROUND = "foreground"
 
 ROUTE_LABELS = {
     ROUTE_POSTMESSAGE: "后台点击（PostMessage）—— 不占用鼠标",
-    ROUTE_UIA: "UIA 无障碍接口 —— 需要给项目新增后端",
+    ROUTE_UIA: "UIA 无障碍（按控件 Invoke）—— 不移动鼠标、不抢焦点",
     ROUTE_FOREGROUND: "前台点击（SendInput）—— 会占用鼠标",
 }
 
@@ -168,18 +172,25 @@ def decide(
     chromium_in_chain: bool,
     chromium_under_top: bool,
     click_effect: bool | None,
+    uia_effect: bool | None = None,
 ) -> Decision:
-    """把四路证据合成一个结论。
+    """把几路证据合成一个结论。
 
-    ``click_effect``：``True`` 实测点击后像素有变化，``False`` 没变化，
+    ``click_effect``：``True`` 实测后台投递后像素有变化，``False`` 没变化，
     ``None`` 没做实测或那块区域自身不稳（测不准）。
+
+    ``uia_effect``：同上，但测的是 **UIA Invoke**。``None`` 表示没测（后台那一路已经
+    生效，或者用户跳过了）。
+
+    判断顺序就是证据可信度从高到低，所以 Chromium 的结构判定能压过「像素变了」：
+    网页里焦点/悬停的副作用一样会让画面变，拿它反推「点到了」会误判。
 
     纯函数，不碰 Win32，便于单测。
     """
     reasons: list[str] = []
     blockers: list[str] = []
 
-    # ---- 1. 网页控件：结构上就没戏，实测有变化也不能反悔
+    # ---- 1/2. 结构上 PostMessage 就不可能生效
     if chromium_in_chain:
         reasons.append(
             "坐标所在窗口链里有 Chromium/CEF 窗口 → 这个按钮是网页画的，"
@@ -188,48 +199,79 @@ def decide(
         blockers.append("PostMessage 对网页控件无效")
         if click_effect:
             reasons.append(
-                "实测点击后像素有变化 —— 别据此认为按钮被按到了，"
+                "实测后台投递后像素有变化 —— 别据此认为按钮被按到了，"
                 "网页里焦点/悬停的副作用也会让画面变"
             )
-        return Decision(ROUTE_UIA, CONF_HIGH, reasons, blockers)
+        return _recommend_uia(reasons, blockers, uia_effect, chromium_under_top, base=CONF_HIGH)
 
-    # ---- 2. 框架明确说「不吃 WM_*」（UWP / WinUI 等）
     if framework is not None and not framework.postmessage:
         reasons.append(f"框架是 {framework.name}（依据类名 {framework.evidence}）→ 这类界面不吃 WM_*")
         blockers.append("PostMessage 对这类框架无效")
-        return Decision(ROUTE_UIA, CONF_HIGH, reasons, blockers)
+        return _recommend_uia(reasons, blockers, uia_effect, chromium_under_top, base=CONF_HIGH)
 
-    # ---- 3. 框架说「认 WM_*」，再用实测确认
-    if framework is not None and framework.postmessage:
+    if framework is not None:
         reasons.append(f"框架是 {framework.name}（依据类名 {framework.evidence}）→ 这类界面通常认 WM_*")
-        if click_effect is True:
-            reasons.append("实测点击后像素有变化 → 结构判定与实测一致")
-            return Decision(ROUTE_POSTMESSAGE, CONF_HIGH, reasons, blockers)
-        if click_effect is False:
-            reasons.append(
-                "但实测点击后那一小块屏幕没有变化 → 可能点在了不响应点击的位置，"
-                "或这个控件需要真实鼠标输入"
-            )
-            blockers.append("实测没看到任何反应")
-            return Decision(ROUTE_UIA, CONF_MEDIUM, reasons, blockers)
-        reasons.append("没做实测（--no-click），置信度降到中")
-        return Decision(ROUTE_POSTMESSAGE, CONF_MEDIUM, reasons, blockers)
+    else:
+        reasons.append("没识别出已知框架类名（只能靠实测）")
 
-    # ---- 4. 认不出框架：以实测为准，都没有就保守选前台
+    # ---- 3. 实测后台投递
     if click_effect is True:
-        reasons.append("没识别出已知框架，但实测点击后像素有变化 → 以后台点击为准")
-        decision = Decision(ROUTE_POSTMESSAGE, CONF_MEDIUM, reasons, blockers)
-    elif click_effect is False:
-        reasons.append("没识别出已知框架，且实测点击后像素没变化 → 后台点击大概率无效")
-        blockers.append("实测没看到任何反应")
-        decision = Decision(ROUTE_UIA, CONF_LOW, reasons, blockers)
+        reasons.append("实测后台投递后像素有变化 → 结构判定与实测一致，后台点击可用")
+        confidence = CONF_HIGH if framework is not None else CONF_MEDIUM
+        return _finish(Decision(ROUTE_POSTMESSAGE, confidence, reasons, blockers), chromium_under_top)
+
+    if click_effect is False:
+        reasons.append("但实测后台投递后那一小块屏幕没有变化 → 后台这条路实测不通")
+        blockers.append("PostMessage 实测没看到任何反应")
+        base = CONF_MEDIUM if framework is not None else CONF_LOW
+        return _recommend_uia(reasons, blockers, uia_effect, chromium_under_top, base=base)
+
+    # ---- 4. 没做后台实测
+    if framework is not None:
+        reasons.append("没做后台实测（--no-click），置信度降到中")
+        return _finish(Decision(ROUTE_POSTMESSAGE, CONF_MEDIUM, reasons, blockers), chromium_under_top)
+
+    if uia_effect is True:
+        reasons.append("没做后台实测，但 UIA Invoke 实测有效 → 直接用 UIA")
+        return _recommend_uia(reasons, blockers, uia_effect, chromium_under_top, base=CONF_MEDIUM)
+
+    reasons.append(
+        "既没识别出已知框架类名，也没做实测 → 判不出来。"
+        "先按前台跑最稳（前台 SendInput 一定会生效），或去掉 --no-click 再跑一次"
+    )
+    return _finish(Decision(ROUTE_FOREGROUND, CONF_LOW, reasons, blockers), chromium_under_top)
+
+
+def _recommend_uia(
+    reasons: list[str],
+    blockers: list[str],
+    uia_effect: bool | None,
+    chromium_under_top: bool,
+    *,
+    base: str,
+) -> Decision:
+    """推荐 UIA 的结论，再按 UIA 的实测结果调整置信度。"""
+    if uia_effect is True:
+        reasons.append("实测 UIA Invoke 让画面变了 → 这条路确实是通的，可以直接用「UIA 无障碍」模式")
+        confidence = CONF_HIGH
+    elif uia_effect is False:
+        reasons.append(
+            "实测 UIA Invoke 也没让画面变 —— 可能是取到的控件不对，"
+            "或者 Invoke 生效了但影响落在比对区域之外"
+        )
+        blockers.append("UIA Invoke 实测没看到反应")
+        confidence = CONF_LOW
     else:
         reasons.append(
-            "既没识别出已知框架类名，也没做实测 → 判不出来。"
-            "先按前台跑最稳（前台 SendInput 一定会生效），或去掉 --no-click 再跑一次"
+            "没做 UIA 实测（--no-click 会跳过，也可能当时没找到可 Invoke 的控件）："
+            "去掉 --no-click 再跑一次就能确认这条路通不通"
         )
-        decision = Decision(ROUTE_FOREGROUND, CONF_LOW, reasons, blockers)
+        confidence = base
+    return _finish(Decision(ROUTE_UIA, confidence, reasons, blockers), chromium_under_top)
 
+
+def _finish(decision: Decision, chromium_under_top: bool) -> Decision:
+    """补一句「顶层窗口下另有网页」的备注——它不是决定性的，只是补充信息。"""
     if chromium_under_top:
         decision.reasons.append(
             "注：该顶层窗口下另有 Chromium/CEF 子窗口，说明界面里内嵌了网页，"
@@ -506,17 +548,22 @@ class UiaProbe:
 
     available: bool = False
     note: str = ""
+    max_hops: int = 0
     point_name: str | None = None
     point_type: str | None = None
     point_class: str | None = None
+    point_pid: int = 0
+    point_offscreen: bool = False
     point_invoke: bool | None = None
-    hits: list[str] = field(default_factory=list)
-    hits_invocable: int = 0
+    # 往上找到的那个「点了会有反应」的控件 —— 界面里选 UIA 模式后点的就是它
+    target_found: bool = False
+    target_desc: str = ""
+    target_hops: int = 0
 
     @property
     def viable(self) -> bool:
-        """UIA 这条路是否明显值得走。"""
-        return bool(self.point_invoke) or self.hits_invocable > 0
+        """UIA 这条路是否走得通：坐标下的控件**或它的某个祖先**支持 InvokePattern。"""
+        return self.target_found
 
 
 @dataclass
@@ -666,105 +713,122 @@ def report_template(info: TemplateInfo) -> None:
 
 # ============================================================== UIA
 def probe_uia(x: int, y: int) -> UiaProbe:
-    """用 UIA 看一眼这个点：能不能拿到元素、支不支持 ``InvokePattern``。"""
+    """用**项目自己的** UIA 层看一眼这个点：能不能拿到控件、支不支持 ``InvokePattern``。
+
+    走的就是 ``UiaBackend`` 的那条路（同一个客户端、同一个 ``walk_to_invokable``），
+    所以这里的结论直接等于「界面上选 UIA 模式后会怎么做」——探针不会说一套、跑起来是另一套。
+    """
+    from app.win.uia import DEFAULT_MAX_PARENT_HOPS, UiaClient, walk_to_invokable
+
     result = UiaProbe()
-    try:
-        import uiautomation as auto  # type: ignore
-    except Exception:
-        result.note = "未安装 uiautomation"
+    client = UiaClient()
+    if not client.available:
+        result.note = client.last_error or "UIA 不可用"
+        return result
+    result.available = True
+    result.max_hops = DEFAULT_MAX_PARENT_HOPS
+
+    element = client.element_from_point(x, y)
+    if element is None:
+        result.note = "该坐标处没取到控件（目标可能没暴露无障碍树）"
         return result
 
-    result.available = True
     try:
-        auto.SetGlobalSearchTimeout(3)
-    except Exception:  # noqa: BLE001
-        pass
+        info = element.info()
+        result.point_name = info.name
+        result.point_type = info.control_type_name
+        result.point_class = info.class_name
+        result.point_pid = info.process_id
+        result.point_offscreen = info.offscreen
+        result.point_invoke = element.can_invoke()
 
-    def _attr(ctrl, name: str) -> str | None:
-        try:
-            return str(getattr(ctrl, name))
-        except Exception:  # noqa: BLE001 - 某些节点取属性就会抛
-            return None
-
-    def _can_invoke(ctrl) -> bool:
-        try:
-            ctrl.GetInvokePattern()
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-
-    # 光标下的那个元素 —— 最直接的证据
-    try:
-        ctrl = auto.ControlFromPoint(x, y)
-        if ctrl is not None:
-            result.point_name = _attr(ctrl, "Name")
-            result.point_type = _attr(ctrl, "ControlTypeName")
-            result.point_class = _attr(ctrl, "ClassName")
-            result.point_invoke = _can_invoke(ctrl)
-    except Exception as exc:  # noqa: BLE001 - 探针不该因为 UIA 异常中断
-        result.note = f"取光标下元素失败：{exc!r}"
-
-    # 整棵树上找「继续 / 取消」这类按钮
-    keywords = {"继续", "取消", "Continue", "Cancel", "Resume"}
-    try:
-        queue: list[tuple[object, int]] = [(auto.GetRootControl(), 0)]
-        budget = 6000
-        while queue and budget > 0:
-            node, depth = queue.pop(0)
-            budget -= 1
-            name = _attr(node, "Name") or ""
-            if name in keywords:
-                invocable = _can_invoke(node)
-                if invocable:
-                    result.hits_invocable += 1
-                result.hits.append(
-                    f"{name!r} [{_attr(node, 'ControlTypeName')}] "
-                    f"类名={_attr(node, 'ClassName')} "
-                    + ("支持 InvokePattern ✅" if invocable else "不支持 Invoke")
-                )
-            if depth >= 24:
-                continue
-            try:
-                children = node.GetChildren()
-            except Exception:  # noqa: BLE001
-                children = []
-            for child in children or []:
-                queue.append((child, depth + 1))
-    except Exception as exc:  # noqa: BLE001
-        result.note = f"遍历 UIA 树失败：{exc!r}"
+        target, hops = walk_to_invokable(element, DEFAULT_MAX_PARENT_HOPS)
+        if target is not None:
+            result.target_found = True
+            result.target_hops = hops
+            result.target_desc = target.info().describe()
+            if target is not element:
+                target.close()
+    finally:
+        element.close()
+        client.close()
     return result
 
 
 def report_uia(uia: UiaProbe) -> None:
-    _rule("④ UIA 无障碍接口（PostMessage 走不通时，决定值不值得加这个后端）")
+    _rule("④ UIA 无障碍接口（PostMessage 走不通时的「中路」）")
     if not uia.available:
-        print(f"  跳过：{uia.note}。想测这条路先执行：pip install uiautomation")
+        print(f"  跳过：{uia.note}")
         return
     if uia.note:
         print(f"  ⚠ {uia.note}")
 
-    print("  · 光标下的元素：")
+    print("  · 坐标下那个控件：")
     if uia.point_name is None and uia.point_type is None:
-        print("      （没取到元素）")
+        print("      （没取到控件）")
     else:
-        print(f"      名称            : {uia.point_name!r}")
-        print(f"      控件类型        : {uia.point_type}")
-        print(f"      类名            : {uia.point_class}")
-        flag = "是 ← 可以直接 Invoke，不失焦、不占鼠标" if uia.point_invoke else "否"
-        print(f"      支持 InvokePattern: {flag}")
+        print(f"      名称                    : {uia.point_name!r}")
+        print(f"      控件类型                : {uia.point_type}")
+        print(f"      类名                    : {uia.point_class}")
+        print(f"      所在进程 pid            : {uia.point_pid}")
+        if uia.point_offscreen:
+            print("      注意                    : 它当前是「离屏」状态")
+        flag = "是" if uia.point_invoke else "否"
+        print(f"      它自己支持 InvokePattern : {flag}")
 
     print()
-    print("  · 整棵 UIA 树里的『继续 / 取消』类按钮：")
-    if uia.hits:
-        for line in uia.hits[:10]:
-            print(f"      · {line}")
-        print(f"      共 {len(uia.hits)} 个，其中 {uia.hits_invocable} 个支持 InvokePattern。")
+    print(f"  · 往上 {uia.max_hops} 层找第一个能 Invoke 的控件（UIA 模式会点它）：")
+    if uia.target_found:
+        where = "就是坐标下这个控件" if uia.target_hops == 0 else f"往上 {uia.target_hops} 层"
+        print(f"      ✅ {uia.target_desc}")
+        print(f"         （{where}）")
+        print("      → UIA 这条路是通的：直接 Invoke 它，不移动鼠标、不抢焦点。")
     else:
-        print("      没找到。可能是按钮在 JCEF 网页里且无障碍没激活，")
-        print("      或 IDEA 的『Support screen readers』/ Java Access Bridge 没开。")
+        print("      ❌ 没找到。UIA 只能点有 Invoke 语义的控件（按钮/链接/菜单项）。")
+        print("         如果目标本该有按钮，多半是无障碍树没暴露出来：")
+        print("           a) IDEA：Settings → Appearance & Behavior → Appearance →")
+        print("              勾上 Support screen readers")
+        print("           b) JBR 的 jabswitch -enable（改完要重启 IDEA）")
 
 
 # ============================================================== 实测点击
+def _pixel_region(x: int, y: int, width: int, height: int) -> tuple[int, int, int, int]:
+    """以 ``(x, y)`` 为中心取一块要比对的屏幕区域（整块保证落在屏幕里）。"""
+    from app.win.geometry import virtual_screen_rect
+
+    screen = virtual_screen_rect()
+    return clamp_region(x, y, width, height, (screen.x, screen.y, screen.right, screen.bottom))
+
+
+def _capture(region: tuple[int, int, int, int]) -> bytes:
+    from app.win.geometry import ScreenRect
+    from app.win.screen import capture_screen
+
+    return capture_screen(ScreenRect(*region)).data
+
+
+def _settle(region: tuple[int, int, int, int]) -> tuple[bool, bytes]:
+    """连拍两帧确认这块区域**自己不会变**，返回 ``(稳定吗, 基准像素)``。
+
+    区域自己在动（动画、光标闪烁）时，后面任何「有变化」都是噪声。
+    """
+    before = _capture(region)
+    time.sleep(0.25)
+    settled = _capture(region)
+    return before == settled, settled
+
+
+def _judge(effect: ClickEffect, settled: bytes) -> None:
+    """拍下动作之后的画面，与基准比对，结论写回 ``effect``。"""
+    time.sleep(0.45)
+    after = _capture(effect.region)
+    if not effect.stable_before:
+        effect.changed = None
+        effect.note = "动手之前那块区域自己就在变（动画/光标闪烁），实测结果不可信"
+    else:
+        effect.changed = after != settled
+
+
 def measure_click_effect(x: int, y: int, width: int, height: int) -> ClickEffect:
     """真的投一记后台点击，并比对点击前后那块屏幕的像素。
 
@@ -772,14 +836,9 @@ def measure_click_effect(x: int, y: int, width: int, height: int) -> ClickEffect
     """
     from app.input.base import MouseButton
     from app.input.postmessage import PostMessageBackend
-    from app.win.geometry import ScreenRect, virtual_screen_rect
-    from app.win.screen import capture_screen
 
     effect = ClickEffect()
-    screen = virtual_screen_rect()
-    bounds = (screen.x, screen.y, screen.right, screen.bottom)
-    region = clamp_region(x, y, width, height, bounds)
-    effect.region = region
+    effect.region = _pixel_region(x, y, width, height)
 
     backend = PostMessageBackend()
     if not backend.bind_point(x, y):
@@ -796,39 +855,87 @@ def measure_click_effect(x: int, y: int, width: int, height: int) -> ClickEffect
     effect.target_desc = describe_window(hwnd)
     effect.client = (cx, cy)
 
-    before = capture_screen(ScreenRect(*region)).data
-    time.sleep(0.25)
-    settled = capture_screen(ScreenRect(*region)).data
-    effect.stable_before = before == settled
-
+    effect.stable_before, settled = _settle(effect.region)
     backend.click(x, y, MouseButton.LEFT)
-    time.sleep(0.45)
-    after = capture_screen(ScreenRect(*region)).data
-
-    if not effect.stable_before:
-        effect.changed = None
-        effect.note = "点击前那块区域自己就在变（动画/光标闪烁），实测结果不可信"
-    else:
-        effect.changed = after != settled
+    _judge(effect, settled)
     return effect
 
 
-def report_click_effect(effect: ClickEffect) -> None:
-    _rule("⑤ 实测：真投一记后台点击，看画面有没有变化")
+def measure_uia_effect(x: int, y: int, width: int, height: int) -> ClickEffect:
+    """用 UIA 真 Invoke 一记，并比对前后像素。
+
+    这是「中路通不通」的唯一硬证据：PostMessage 没反应不代表没救——UIA 的 Invoke 走的是
+    控件自己的语义，跟消息队列没关系。点的那个控件和 ``UiaBackend`` 跑起来点的是同一个。
+    """
+    from app.win.uia import DEFAULT_MAX_PARENT_HOPS, UiaClient, walk_to_invokable
+
+    effect = ClickEffect()
+    effect.region = _pixel_region(x, y, width, height)
+
+    client = UiaClient()
+    if not client.available:
+        effect.note = client.last_error or "UIA 不可用"
+        return effect
+    element = client.element_from_point(x, y)
+    if element is None:
+        effect.note = "该坐标处没取到控件，没法实测 UIA"
+        return effect
+
+    try:
+        target, hops = walk_to_invokable(element, DEFAULT_MAX_PARENT_HOPS)
+        if target is None:
+            effect.note = "这个控件及其祖先都不支持 InvokePattern，没法实测 UIA"
+            return effect
+        try:
+            info = target.info()
+            effect.tested = True
+            effect.target_class = info.class_name
+            effect.target_desc = info.describe() + (f"（往上 {hops} 层）" if hops else "")
+
+            effect.stable_before, settled = _settle(effect.region)
+            if not target.invoke():
+                effect.changed = None
+                effect.note = "InvokePattern.Invoke() 调用失败"
+                return effect
+            _judge(effect, settled)
+        finally:
+            if target is not element:
+                target.close()
+    finally:
+        element.close()
+        client.close()
+    return effect
+
+
+def report_effect(name: str, what: str, effect: ClickEffect) -> None:
+    """打印一次实测的结果——PostMessage 与 UIA 用同一套说法，好直接对照。"""
+    print(f"  · {name} —— {what}")
     if not effect.tested:
-        print(f"  没做实测：{effect.note}")
+        print(f"      没做实测：{effect.note}")
         return
-    print(f"  实收窗口：{effect.target_desc}")
-    print(f"      ← 类名 {effect.target_class}")
-    print(f"  客户区坐标：{effect.client}，比对区域：{effect.region}")
+    if effect.target_desc:
+        print(f"      实收对象  : {effect.target_desc}")
+    if effect.client:
+        print(f"      客户区坐标: {effect.client}")
+    print(f"      比对区域  : {effect.region}")
     if effect.changed is None:
-        print(f"  ⚠ {effect.note}")
-        print("  → 这一项的结论按「没做实测」处理。")
+        print(f"      ⚠ {effect.note}")
+        print("      → 这一项按「没做实测」处理。")
     elif effect.changed:
-        print("  → 点击后那块区域**变了**：说明目标确实处理了这记消息。")
+        print("      → 那块区域**变了**：这一路真的生效了。")
     else:
-        print("  → 点击后那块区域**没有变化**。注意：按钮被按下可能只闪一下，")
-        print("    所以「没变化」是弱证据，「有变化」才是强证据。")
+        print("      → 那块区域**没有变化**。注意：按钮被按下可能只闪一下，")
+        print("        所以「没变化」是弱证据，「有变化」才是强证据。")
+
+
+def report_effects(effect: ClickEffect, uia_effect: ClickEffect | None, why_no_uia: str) -> None:
+    _rule("⑤ 实测：真点一记，看画面有没有变化")
+    report_effect("后台投递 PostMessage", "「后台点击」模式干的就是这件事", effect)
+    print()
+    if uia_effect is None:
+        print(f"  · UIA Invoke —— 没测：{why_no_uia}")
+    else:
+        report_effect("UIA Invoke", "「UIA 无障碍」模式干的就是这件事", uia_effect)
 
 
 # ============================================================== 结论
@@ -878,32 +985,37 @@ def _how_to(route: str, name: str, uia: UiaProbe) -> None:
     print("  怎么用：")
     if route == ROUTE_POSTMESSAGE:
         print(f"    1. 打开 AutoClicker，载入方案「{name}」")
-        print("    2. 勾上「后台点击 (不占用鼠标)」")
-        print("    3. 点「绑定窗口」，然后到目标窗口上点一下（状态栏会显示绑到的标题）")
+        print("    2. 输入方式选「后台点击（PostMessage，不占鼠标）」")
+        print("    3. 点「绑定窗口」，然后到目标窗口上点一下（标签会显示绑到的标题）")
         print("    4. 按 F9 开始。执行期间鼠标照常用；目标窗口被遮挡甚至最小化也能收消息，")
         print("       但别把它关掉（窗口没了，消息就没地方投）")
-        print("    注：「后台点击」这个勾不会被记住，每次启动都要重新勾。")
+        print("    注：输入方式不会被记住，每次启动都要重新选。")
         return
 
     if route == ROUTE_UIA:
         if uia.viable:
-            print("    PostMessage 对你这个目标走不通，但 **UIA 是通的**（见上面第 ④ 节：")
-            print("    找到了按钮或光标下的元素支持 InvokePattern）。")
-            print("    本项目现在只有前台/后台两种输入后端，**还没有 UIA 后端** ——")
-            print("    要真正用上这条路，需要给项目加一个 UIA 后端（Invoke 按钮，")
-            print("    完全不移动鼠标、不失焦）。短期先按下面的「前台」跑起来即可。")
+            print("    PostMessage 对这个目标走不通，但 **UIA 是通的**（见第 ④ 节：")
+            print("    坐标下的控件或它的祖先支持 InvokePattern，能直接 Invoke）。")
+            print("    UIA 不移动鼠标、不抢焦点，网页控件也照点。")
         else:
-            print("    PostMessage 和 UIA 都没走通（第 ④ 节没找到可 Invoke 的按钮）。")
+            print("    PostMessage 走不通，UIA 这边也没找到能 Invoke 的控件。")
             print("    想救活 UIA 这条中路的，先做这两件事再重跑本脚本：")
             print("      a) IDEA：Settings → Appearance & Behavior → Appearance →")
             print("         勾上 Support screen readers")
             print("      b) JBR 的 jabswitch -enable（改完要重启 IDEA）")
-    else:
-        print("    判不出结构，或者结构与实测都不支持后台点击 —— 先用前台跑起来：")
+        print()
+        print(f"    1. 打开 AutoClicker，载入方案「{name}」")
+        print("    2. 输入方式选「UIA 无障碍（按控件点击，不移动鼠标）」")
+        print("    3.（可选）点「绑定窗口」：UIA 模式下它是**安全校验**——")
+        print("       坐标下的控件不属于绑定的窗口就跳过，免得点到遮挡者身上")
+        print("    4. 按 F9 开始。执行期间鼠标照常用。")
+        print("    注：UIA 模式下的键盘、移动、右键会回落到前台注入（日志里会提示一次）。")
+        return
 
+    print("    判不出结构，或者结构与实测都不支持后台点击 —— 先用前台跑起来：")
     print()
     print(f"    1. 打开 AutoClicker，载入方案「{name}」")
-    print("    2. **不要**勾「后台点击」（保持前台 SendInput）")
+    print("    2. 输入方式保持「前台点击（SendInput）」")
     print("    3. 按 F9 开始。执行期间鼠标会被占用；要找图的那个区域必须显示在屏幕上")
     print("       （被别的窗口遮住的像素抓到的是遮挡物，不是按钮）")
     print("    4. 想中止按 F10。")
@@ -984,20 +1096,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_uia(uia)
 
     # ---- 实测
+    uia_effect: ClickEffect | None = None
+    why_no_uia = ""
     if args.no_click:
         effect = ClickEffect(note="--no-click")
+        why_no_uia = "--no-click"
     else:
         if not args.yes:
             print()
             answer = input("要现在用后台方式真点一下这个位置吗？(y/N) ").strip().lower()
         else:
             answer = "y"
-        effect = (
-            measure_click_effect(x, y, width, height)
-            if answer == "y"
-            else ClickEffect(note="你选择了跳过")
-        )
-    report_click_effect(effect)
+        if answer != "y":
+            effect = ClickEffect(note="你选择了跳过")
+            why_no_uia = "你跳过了后台实测"
+        else:
+            effect = measure_click_effect(x, y, width, height)
+            # 后台没生效时，接着试「中路」——「点了没反应」之后最该问的就是这个问题，
+            # 答案直接决定要不要换成 UIA 模式。
+            if effect.changed is True:
+                why_no_uia = "后台投递已经看到变化，不用再试"
+            elif not uia.viable:
+                why_no_uia = "第 ④ 节里没找到能 Invoke 的控件"
+            else:
+                if args.yes:
+                    more = "y"
+                else:
+                    print()
+                    more = input(
+                        "后台投递没看到变化。要用 UIA 真 Invoke 一下试试吗？(y/N) "
+                    ).strip().lower()
+                if more == "y":
+                    uia_effect = measure_uia_effect(x, y, width, height)
+                else:
+                    why_no_uia = "你跳过了"
+    report_effects(effect, uia_effect, why_no_uia)
 
     # ---- 结论
     decision = decide(
@@ -1005,6 +1138,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         chromium_in_chain=bool(analysis.chromium_rows),
         chromium_under_top=bool(analysis.chromium_under_top),
         click_effect=effect.changed,
+        uia_effect=None if uia_effect is None else uia_effect.changed,
     )
 
     name = args.save or f"探针方案-{time.strftime('%m%d-%H%M')}"

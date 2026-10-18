@@ -139,6 +139,10 @@ class PostMessageBackend(InputBackend):
     def close(self) -> None:
         self.unbind()
 
+    def reset_notices(self) -> None:
+        """每次开始运行前重置「只提示一次」的标记。"""
+        self._warned_no_target = False
+
     # ---------------------------------------------------------------- 目标解析
     def _resolve(self, x: int, y: int) -> tuple[int, int, int] | None:
         """把屏幕坐标解析成 ``(hwnd, client_x, client_y)``，解析不了返回 ``None``。"""

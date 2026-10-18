@@ -28,7 +28,7 @@
     │        启动延迟 · 序列轮数 · 轮次间隔            │
     ├ 步骤序列（StepEditor）  ┬ 日志（可拖动分隔条）────┤
     ├─ 开始 / 停止 · 状态 · 进度条 ────────────────────┤
-    ├─ 输入方式：前台 SendInput / 后台 PostMessage ────┤
+    ├─ 输入方式：前台 SendInput / 后台 PostMessage / UIA ─┤
     └─ 状态栏：热键提示 ───────────────────────────────┘
 
 跨线程通信一律走信号：``MacroEngine`` 在工作线程里发信号，槽在主线程序列化执行。
@@ -87,6 +87,13 @@ HOTKEY_SPECS = (
     (HK_RECORD, "F11", "录制"),
 )
 
+# 输入方式。只是界面上的选择，不进方案文件——同一个方案换个方式跑是常有的事。
+# postmessage / uia 与对应后端的 ``name`` 一致，foreground 则不对应 sendinput——这里
+# 描述的是「界面上的模式」，而前台后端本身没有「模式」这一说。
+MODE_FOREGROUND = "foreground"
+MODE_POSTMESSAGE = "postmessage"
+MODE_UIA = "uia"
+
 
 class MainWindow(QMainWindow):
     """自动点击器主窗口。"""
@@ -103,10 +110,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._hotkeys = hotkeys
         self._picker = PickCoordinator(self)
-        # 前台后端由 main.py 注入；后台后端在用户第一次切到后台模式时才创建，
-        # 免得不开后台模式也去 import 一堆 Win32 消息相关的东西
+        # 前台后端由 main.py 注入；后台/UIA 后端在用户第一次切到那个模式时才创建，
+        # 免得不开那些模式也去 import 一堆 Win32 消息 / COM 相关的东西
         self._foreground_backend = backend
         self._background_backend = None
+        self._uia_backend = None
         self._hotkey_ready: dict[int, bool] = {}
         self._force_quit = False
         self._shutdown_done = False
@@ -307,23 +315,39 @@ class MainWindow(QMainWindow):
         return holder
 
     def _build_backend_row(self) -> QHBoxLayout:
-        """输入方式一行：前台 SendInput / 后台 PostMessage + 绑定窗口。
+        """输入方式一行：三种注入方式 + 绑定窗口。
 
-        只有「后台」需要目标窗口，所以绑定按钮默认置灰，勾上后台才可用。
+        三者的取舍：
+        - **前台 SendInput**：最通用（真实输入，什么程序都认），但运行期间占用鼠标；
+        - **后台 PostMessage**：不占鼠标，但只对处理 ``WM_*`` 的经典 Win32 窗口有效；
+        - **UIA 无障碍**：不移动鼠标、不抢焦点，网页控件（JCEF/Electron）也能点，
+          但要求目标暴露无障碍树。
+
+        只有「后台」必须绑定窗口；UIA 的绑定是可选的**安全校验**（坐标下的控件不属于
+        绑定的窗口就跳过，免得点到遮挡者身上）；前台注入不需要绑定。
         """
-        self._background_check = QCheckBox("后台点击 (不占用鼠标)")
-        self._background_check.setToolTip(
-            "勾选后点击通过 PostMessage 投递给目标窗口，不会移动系统光标，"
-            "运行期间可以正常用鼠标，也不要求目标窗口在前台。\n\n"
-            "代价：只对处理 WM_* 消息的经典 Win32 窗口有效——Chromium/Electron、"
-            "游戏、部分 UWP 会忽略投递进来的消息（表现为「点了没反应」）。"
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("前台点击（SendInput）", MODE_FOREGROUND)
+        self._mode_combo.addItem("后台点击（PostMessage，不占鼠标）", MODE_POSTMESSAGE)
+        self._mode_combo.addItem("UIA 无障碍（按控件点击，不移动鼠标）", MODE_UIA)
+        self._mode_combo.setToolTip(
+            "前台（SendInput）：往系统输入队列里塞真实事件——最通用，但运行期间鼠标被占用。\n\n"
+            "后台（PostMessage）：把 WM_* 消息投递给目标窗口——不占鼠标，但只对处理这些消息的\n"
+            "经典 Win32 窗口有效；Chromium/Electron/JCEF、游戏、部分 UWP 会忽略（表现为「点了没反应」）。\n\n"
+            "UIA 无障碍：按坐标取到「控件」再调用它的 Invoke——不移动鼠标、不抢焦点，网页控件\n"
+            "也照点；代价是要求目标暴露无障碍树（Swing 要开 Java Access Bridge +\n"
+            "IDEA 的 Support screen readers），且只能点有 Invoke 语义的控件（按钮/链接/菜单项）。\n"
+            "键盘、移动、右键在 UIA 里没有对应语义，会回落到前台注入。\n\n"
+            "拿不准就用 tools\\probe_background.py 跑一次，它会直接给结论。"
         )
-        self._background_check.toggled.connect(self._on_backend_mode_changed)
+        self._mode_combo.currentIndexChanged.connect(self._on_backend_mode_changed)
 
         self._bind_button = QPushButton("绑定窗口")
         self._bind_button.setToolTip(
-            "点一下，然后在屏幕上点击目标窗口，把它设为后台点击的目标。\n"
-            "不绑定也能用：会按每次点击的坐标临时识别当时最顶层的窗口。"
+            "点一下，然后在屏幕上点击目标窗口。\n\n"
+            "后台（PostMessage）：把它设为点击的投递目标；不绑定也能用，会按每次点击的坐标\n"
+            "临时识别当时最顶层的窗口。\n"
+            "UIA：作为安全校验——坐标下的控件不属于绑定的窗口时跳过（被遮挡时会出现这种情况）。"
         )
         self._bind_button.setEnabled(False)
         self._bind_button.clicked.connect(self._bind_window)
@@ -332,7 +356,7 @@ class MainWindow(QMainWindow):
         self._bind_label.setStyleSheet("color: #9aa4b2;")
 
         row = QHBoxLayout()
-        row.addWidget(self._background_check)
+        row.addWidget(self._mode_combo)
         row.addWidget(self._bind_button)
         row.addWidget(self._bind_label, 1)
         self._refresh_bind_label()
@@ -447,15 +471,22 @@ class MainWindow(QMainWindow):
         # 未保存的改动先落盘，避免辛苦编辑的内容丢掉
         self.save_current(silent=True)
 
-        # 按界面选择决定这次用前台还是后台注入。
+        # 按界面选择决定这次用哪种注入方式。
         # 必须在 start 之前：引擎在运行中不允许换后端。
         backend = self._active_backend()
         self._run.set_backend(backend)
-        if backend is self._background_backend:
+        mode = self._mode
+        if mode == MODE_POSTMESSAGE:
             if backend.bound_window:
                 self.log_append.emit(f"[后台点击] 目标窗口：{backend.bound_title}")
             else:
                 self.log_append.emit("[后台点击] 未绑定窗口，将按每次点击的坐标临时识别窗口")
+        elif mode == MODE_UIA:
+            bound = f"，校验窗口：{backend.bound_title}" if backend.bound_window else "（未绑定校验窗口）"
+            self.log_append.emit(
+                f"[UIA] 按控件 Invoke 点击，不移动鼠标、不抢焦点{bound}；"
+                "键盘/移动/右键回落到前台注入"
+            )
 
         if self._minimize_check.isChecked():
             self.hide()
@@ -533,51 +564,87 @@ class MainWindow(QMainWindow):
             self.log_append.emit("[提示] 该步骤没有「坐标」可写，已忽略")
 
     # ================================================================ 输入方式
-    def _ensure_background_backend(self):
-        """按需创建后台后端。延迟创建是为了不开后台模式时不碰这些 Win32 消息。"""
-        if self._background_backend is None:
-            from ..input.postmessage import PostMessageBackend
+    @property
+    def _mode(self) -> str:
+        """界面上当前选的输入方式。"""
+        return self._mode_combo.currentData()
 
-            self._background_backend = PostMessageBackend()
-        return self._background_backend
+    def _ensure_backend(self, mode: str):
+        """按需创建某个后端。
+
+        延迟创建是为了「不开那个模式就完全不碰它」：PostMessage 要 import 一整套
+        Win32 消息代码，UIA 要 import COM 那一层。
+        """
+        if mode == MODE_POSTMESSAGE:
+            if self._background_backend is None:
+                from ..input.postmessage import PostMessageBackend
+
+                self._background_backend = PostMessageBackend()
+            return self._background_backend
+        if mode == MODE_UIA:
+            if self._uia_backend is None:
+                from ..input.uia import UiaBackend
+
+                # 移动/按键/右键在 UIA 里没有对应语义，交回前台后端
+                self._uia_backend = UiaBackend(fallback=self._foreground_backend)
+            return self._uia_backend
+        return self._foreground_backend
 
     def _active_backend(self):
         """按界面上的选择返回本次运行要用的后端。"""
-        if self._background_check.isChecked():
-            return self._ensure_background_backend()
-        return self._foreground_backend
+        return self._ensure_backend(self._mode)
 
-    @Slot(bool)
-    def _on_backend_mode_changed(self, enabled: bool) -> None:
-        if enabled:
+    def _bindable_backend(self):
+        """「绑定窗口」该作用在哪个后端上；前台模式没有可绑的东西，返回 ``None``。"""
+        if self._mode == MODE_FOREGROUND:
+            return None
+        return self._ensure_backend(self._mode)
+
+    @Slot(int)
+    def _on_backend_mode_changed(self, _index: int) -> None:
+        mode = self._mode
+        if mode == MODE_POSTMESSAGE:
             self.log_append.emit(
                 "[提示] 已切换到后台点击（PostMessage）：不移动光标、不要求目标窗口在前台；"
                 "建议先点「绑定窗口」选定目标，否则按每次点击的坐标临时识别窗口。"
             )
+        elif mode == MODE_UIA:
+            self.log_append.emit(
+                "[提示] 已切换到 UIA 无障碍点击：按控件 Invoke，不移动鼠标、不抢焦点，"
+                "网页控件也能点；需要目标暴露无障碍树（Swing 要开 Support screen readers）。"
+                "键盘/移动/右键会回落到前台注入。"
+            )
         else:
-            self.log_append.emit("[提示] 已切回前台点击（SendInput）")
+            self.log_append.emit("[提示] 已切换到前台点击（SendInput）")
         self._refresh_bind_label()
         self._sync_backend_controls()
 
     def _refresh_bind_label(self) -> None:
-        if not self._background_check.isChecked():
-            self._bind_label.setText("默认：前台注入（SendInput）")
+        mode = self._mode
+        if mode == MODE_FOREGROUND:
+            self._bind_label.setText("无需绑定：前台注入按光标位置点击")
             return
-        backend = self._background_backend
+        backend = self._background_backend if mode == MODE_POSTMESSAGE else self._uia_backend
         if backend is not None and backend.bound_window:
-            self._bind_label.setText(f"目标窗口：{backend.bound_title}")
+            prefix = "校验窗口" if mode == MODE_UIA else "目标窗口"
+            self._bind_label.setText(f"{prefix}：{backend.bound_title}")
+        elif mode == MODE_UIA:
+            self._bind_label.setText("未绑定（可选：绑定后只点该窗口里的控件）")
         else:
             self._bind_label.setText("未绑定（将按点击坐标自动识别窗口）")
 
     def _sync_backend_controls(self) -> None:
         """按「是否在跑 / 是否在录」刷新这一行控件的可用性。"""
         busy = self._run.running or self._record.recording
-        self._background_check.setEnabled(not busy)
-        self._bind_button.setEnabled(self._background_check.isChecked() and not busy)
+        self._mode_combo.setEnabled(not busy)
+        self._bind_button.setEnabled(self._mode != MODE_FOREGROUND and not busy)
 
     @Slot()
     def _bind_window(self) -> None:
-        """走一次取点流程，把屏幕上点到的那个窗口设为后台点击目标。"""
+        """走一次取点流程，把屏幕上点到的那个窗口设为目标。
+
+        后台模式下它是消息投递目标；UIA 模式下它是安全校验（不属于它的控件跳过）。
+        """
         if self._run.running or self._record.recording:
             self.log_append.emit("[提示] 任务运行或录制中，请结束后再绑定窗口")
             return
@@ -591,9 +658,12 @@ class MainWindow(QMainWindow):
         )
 
     def _bind_window_at(self, x: int, y: int) -> None:
-        backend = self._ensure_background_backend()
+        backend = self._bindable_backend()
+        if backend is None:
+            return
         if backend.bind_point(x, y):
-            self.log_append.emit(f"已绑定目标窗口：{backend.bound_title}")
+            what = "校验窗口" if self._mode == MODE_UIA else "目标窗口"
+            self.log_append.emit(f"已绑定{what}：{backend.bound_title}")
         else:
             self.log_append.emit(f"[错误] 坐标 ({x}, {y}) 处没有可用的窗口，绑定失败")
         self._refresh_bind_label()
@@ -727,6 +797,7 @@ class MainWindow(QMainWindow):
 
         self._log_panel.detach()
         self._picker.cancel()
-        if self._background_backend is not None:
-            self._background_backend.close()
+        for backend in (self._background_backend, self._uia_backend):
+            if backend is not None:
+                backend.close()
         self._tray.hide()

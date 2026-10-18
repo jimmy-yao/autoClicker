@@ -1932,14 +1932,19 @@ class TestUI(unittest.TestCase):
                 self.app.processEvents()
 
     def test_main_window_backend_switch(self):
-        """默认前台注入；勾上「后台点击」后换 PostMessage 后端，并可用绑定窗口。"""
+        """输入方式下拉：前台 → 后台 PostMessage（可绑定窗口）→ UIA（校验窗口）。"""
         from unittest import mock
 
         from app.input import postmessage as pm
         from app.input.sendinput import SendInputBackend
         from app.storage.config import ProfileStore
-        from app.ui.main_window import MainWindow
+        from app.ui.main_window import MODE_POSTMESSAGE, MODE_UIA, MainWindow
         from app.win.hotkey import HotkeyManager
+
+        def select(window, mode):
+            """像用户那样在下拉框里选一项。"""
+            window._mode_combo.setCurrentIndex(window._mode_combo.findData(mode))
+            self.app.processEvents()
 
         with tempfile.TemporaryDirectory() as tmp:
             foreground = SendInputBackend()
@@ -1947,14 +1952,15 @@ class TestUI(unittest.TestCase):
                 foreground, HotkeyManager(self.app), store=ProfileStore(Path(tmp))
             )
             try:
-                self.assertFalse(window._background_check.isChecked())
+                # 默认前台注入：不需要绑定窗口
+                self.assertEqual(window._mode, "foreground")
                 self.assertIs(window._active_backend(), foreground)
                 self.assertFalse(
-                    window._bind_button.isEnabled(), "没开后台模式时绑定按钮应置灰"
+                    window._bind_button.isEnabled(), "前台模式没有可绑定的东西"
                 )
 
-                window._background_check.setChecked(True)
-                self.app.processEvents()
+                # 切到后台：换成 PostMessage 后端，绑定按钮可用
+                select(window, MODE_POSTMESSAGE)
                 backend = window._active_backend()
                 self.assertIsNot(backend, foreground)
                 self.assertEqual(backend.name, "postmessage")
@@ -1981,6 +1987,15 @@ class TestUI(unittest.TestCase):
                     window.start_clicking()
                 set_backend.assert_called_once()
                 self.assertIs(set_backend.call_args.args[0], backend)
+
+                # 切到 UIA：另一个后端，并把前台后端作为「回落」目标
+                select(window, MODE_UIA)
+                uia = window._active_backend()
+                self.assertIsNot(uia, backend)
+                self.assertEqual(uia.name, "uia")
+                self.assertIs(uia._fallback, foreground)
+                self.assertTrue(window._bind_button.isEnabled())
+                self.assertIn("未绑定", window._bind_label.text())
             finally:
                 window._shutdown()
                 self.app.processEvents()

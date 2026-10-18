@@ -67,6 +67,8 @@ _user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
 _user32.GetWindowTextW.restype = ctypes.c_int
 _user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
 _user32.GetClassNameW.restype = ctypes.c_int
+_user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
 _user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
 _user32.MapVirtualKeyW.restype = wintypes.UINT
@@ -202,3 +204,16 @@ def describe(hwnd: int) -> str:
     """给用户看的窗口描述，形如 ``记事本 [Notepad]``。"""
     title = window_text(hwnd) or "(无标题)"
     return f"{title} [{class_name(hwnd)}]"
+
+
+def process_id(hwnd: int | None) -> int:
+    """窗口所属进程的 pid（拿不到返回 0）。
+
+    UIA 的 ``ElementFromPoint`` 是按屏幕取的：该点被别的窗口挡住时会拿到遮挡者的
+    控件。绑定窗口后用它核对「这个控件是不是我绑的那个窗口的」，避免点到别处去。
+    """
+    if not hwnd:
+        return 0
+    out = wintypes.DWORD(0)
+    _user32.GetWindowThreadProcessId(HWND(int(hwnd)), ctypes.byref(out))
+    return int(out.value)

@@ -86,10 +86,12 @@ class RunController(QObject):
         self._engine.request_stop()
 
     def set_backend(self, backend: InputBackend) -> None:
-        """切换输入后端（前台 SendInput / 后台 PostMessage）。
+        """切换输入后端（前台 SendInput / 后台 PostMessage / UIA）。
 
-        供 MainWindow 在 ``start`` 之前按界面上的选择调用。
+        供 MainWindow 在 ``start`` 之前按界面上的选择调用，顺便重置后端里
+        「只提示一次」的标记——每次运行都该看到那些关键提示。
         """
+        backend.reset_notices()
         self._engine.set_backend(backend)
 
     def shutdown(self) -> None:

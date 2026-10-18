@@ -132,12 +132,13 @@ class TestDecide(unittest.TestCase):
     jcef = probe.Framework(probe._CHROMIUM_FRAMEWORK, False, "Chrome_RenderWidgetHostHWND")
     uwp = probe.Framework("UWP / XAML", False, "ApplicationFrameWindow")
 
-    def _decide(self, framework=None, in_chain=False, under_top=False, effect=None):
+    def _decide(self, framework=None, in_chain=False, under_top=False, effect=None, uia=None):
         return probe.decide(
             framework=framework,
             chromium_in_chain=in_chain,
             chromium_under_top=under_top,
             click_effect=effect,
+            uia_effect=uia,
         )
 
     def test_chromium_in_chain_beats_everything(self):
@@ -194,6 +195,51 @@ class TestDecide(unittest.TestCase):
             any("内嵌了网页" in reason for reason in decision.reasons),
             "顶层窗口下有 Chromium 子窗口时应当提示（但不足以改判）",
         )
+
+    # ---------------------------------------------------------- UIA 实测
+    def test_uia_measurement_confirms_the_middle_route(self):
+        """网页控件（结构上 PostMessage 没戏）+ UIA 实测有效 → 高置信度走 UIA。"""
+        decision = self._decide(in_chain=True, effect=False, uia=True)
+        self.assertEqual(decision.route, probe.ROUTE_UIA)
+        self.assertEqual(decision.confidence, probe.CONF_HIGH)
+        self.assertTrue(any("确实是通的" in reason for reason in decision.reasons))
+
+    def test_uia_measurement_that_did_nothing_lowers_confidence(self):
+        decision = self._decide(in_chain=True, uia=False)
+        self.assertEqual(decision.route, probe.ROUTE_UIA)
+        self.assertEqual(decision.confidence, probe.CONF_LOW)
+        self.assertTrue(
+            any("UIA" in blocker for blocker in decision.blockers),
+            f"UIA 实测没反应必须写进卡点：{decision.blockers}",
+        )
+
+    def test_uia_measurement_rescues_a_framework_that_looked_friendly(self):
+        """类名说它认 WM_*，但实测后台没反应、UIA 有效 —— 以实测为准。"""
+        decision = self._decide(framework=self.swing, effect=False, uia=True)
+        self.assertEqual(decision.route, probe.ROUTE_UIA)
+        self.assertEqual(decision.confidence, probe.CONF_HIGH)
+
+    def test_uia_measurement_rescues_an_unknown_target(self):
+        decision = self._decide(effect=False, uia=True)
+        self.assertEqual(decision.route, probe.ROUTE_UIA)
+        self.assertEqual(decision.confidence, probe.CONF_HIGH)
+
+    def test_both_middle_routes_measured_dead_stays_low(self):
+        """两条中路实测都没动静 —— 「没变化」是弱证据，所以仍保留 UIA 但降到低。"""
+        decision = self._decide(in_chain=True, effect=False, uia=False)
+        self.assertEqual(decision.route, probe.ROUTE_UIA)
+        self.assertEqual(decision.confidence, probe.CONF_LOW)
+        self.assertTrue(decision.blockers)
+
+    def test_missing_uia_measurement_tells_you_how_to_confirm(self):
+        decision = self._decide(in_chain=True)
+        self.assertTrue(any("--no-click" in reason for reason in decision.reasons))
+
+    def test_no_uia_noise_when_postmessage_already_worked(self):
+        """后台已经生效就不必再试 UIA，结论里不该出现 UIA 的唠叨。"""
+        decision = self._decide(framework=self.swing, effect=True)
+        self.assertEqual(decision.route, probe.ROUTE_POSTMESSAGE)
+        self.assertFalse(any("UIA" in reason for reason in decision.reasons))
 
     def test_every_decision_explains_itself(self):
         cases = [
@@ -357,6 +403,24 @@ class TestProfileBuild(unittest.TestCase):
         self.assertIn('"kind": "wait"', text)
 
 
+class TestUiaProbe(unittest.TestCase):
+    """UIA 那一节的判定。
+
+    ``viable`` 决定「后台没反应之后要不要再花一次真点击去试中路」，所以它必须
+    只认「找到了能 Invoke 的控件」这一件事——别把「取到了控件」当成能点。
+    """
+
+    def test_not_viable_by_default(self):
+        self.assertFalse(probe.UiaProbe().viable)
+
+    def test_taking_the_element_is_not_enough(self):
+        probe_result = probe.UiaProbe(available=True, point_name="继续", point_type="文本")
+        self.assertFalse(probe_result.viable, "控件取到了，但没找到能 Invoke 的祖先")
+
+    def test_viable_once_an_invokable_control_was_found(self):
+        self.assertTrue(probe.UiaProbe(available=True, target_found=True).viable)
+
+
 class TestModuleIsImportableEverywhere(unittest.TestCase):
     """非 Windows 上模块仍须可导入，否则这个文件里的用例一条都跑不了。"""
 
@@ -369,6 +433,12 @@ class TestModuleIsImportableEverywhere(unittest.TestCase):
         else:  # pragma: no cover - Linux / macOS
             self.assertIsNone(probe._user32)
             self.assertIsNone(probe._EnumProc)
+
+    def test_uia_section_uses_the_project_own_layer(self):
+        """UIA 那一节不再依赖第三方库——它走的就是界面里选 UIA 模式的那条路。"""
+        source = (Path(probe.__file__)).read_text(encoding="utf-8")
+        self.assertIn("from app.win.uia import", source)
+        self.assertNotIn("import uiautomation", source)
 
 
 if __name__ == "__main__":
