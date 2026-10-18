@@ -261,10 +261,51 @@ class StepEditor(QWidget):
         return KeyStep(vk=vk_of("F5") or 0, repeat=1, interval_ms=50)
 
     def _open_dialog(self, step: Step) -> Step | None:
+        """打开对话框，等用户按下「确定」或「取消」。
+
+        这里**刻意不用 ``dialog.exec()``**。原因是一处 Qt 语义陷阱：
+
+        ``QDialog::setVisible(false)`` 会主动退出 ``exec()`` 起的模态循环
+        （qdialog.cpp 的原话：「Reimplemented to exit a modal event loop when the
+        dialog is hidden」）。而本项目的取点 / 截模板遮罩**必须**先让请求方窗口
+        ``hide()`` 让开——否则模态窗口会拦掉遮罩的鼠标事件、自己也正好挡在要拾取的位置上
+        （见 ``PickCoordinator``）。
+
+        两者一撞，用 ``exec()`` 就会出现「点一下『截取屏幕』＝按了取消」：
+        ``exec()`` 立刻返回 Rejected，这一步被丢掉；等用户拖完框，对话框又因为
+        只剩 ``PickCoordinator`` 一个引用、引用一断就被销毁，表现为**窗口自己关掉了**。
+
+        所以自己起一个事件循环，只在**真正**的 accept / reject（``finished``）时退出；
+        中途被 ``hide()`` / ``show()`` 多少次都不影响。
+        """
+        from PySide6.QtCore import QEventLoop
+
         dialog = StepDialog(step, self._picker, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            return dialog.result_step()
-        return None
+
+        loop = QEventLoop()
+        alive = True
+
+        def _on_destroyed(*_args) -> None:
+            nonlocal alive
+            alive = False
+
+        dialog.finished.connect(loop.quit)
+        # 对话框若在流程中被销毁（例如主窗口被关掉），finished 不会来，
+        # 没有这个兜底这里就会永远挂着
+        dialog.destroyed.connect(_on_destroyed)
+        dialog.destroyed.connect(loop.quit)
+
+        dialog.show()  # 模态属性由 StepDialog.__init__ 里的 setModal(True) 带着
+        loop.exec()
+
+        if not alive:  # pragma: no cover - 只在退出流程里发生
+            return None
+
+        accepted = dialog.result() == QDialog.DialogCode.Accepted
+        edited = dialog.result_step() if accepted else None
+        # exec() 时代这个对话框会作为子对象一直留着（每开一次多一个），顺手收掉
+        dialog.deleteLater()
+        return edited
 
     def _refresh(self) -> None:
         """按 ``self._steps`` 重建表格。"""

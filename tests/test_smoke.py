@@ -2254,6 +2254,93 @@ class TestUI(unittest.TestCase):
         finally:
             dialog.deleteLater()
 
+    def test_find_image_dialog_survives_a_pick_flow(self):
+        """对话框「让开」不能等于「取消」：点截取屏幕 → 拖框 → 点确定，这一步要真的进表。
+
+        回归自实测：``StepDialog`` 以前走 ``exec()``，而 ``PickCoordinator`` 必须先
+        ``hide()`` 掉请求方窗口才能拿到鼠标事件，于是撞上 Qt 的
+        「``QDialog::setVisible(false)`` 会退出 ``exec()`` 的模态循环」——
+        点一下「截取屏幕」就等于按了取消，步骤被丢掉，拖完框窗口还会自己关掉。
+
+        ``exec()`` 起不了循环，这条本身也没有断言可写，所以这里从
+        ``StepEditor.add_step()`` 进（真实调用路径），用它内部那个模态循环跑定时器。
+        """
+        from unittest import mock
+
+        from PySide6.QtCore import QTimer
+
+        from app.ui import position_picker
+        from app.ui.position_picker import PickCoordinator
+        from app.ui.step_dialog import StepDialog
+        from app.ui.step_editor import StepEditor
+        from app.win.geometry import ScreenRect
+
+        picker = PickCoordinator()
+        editor = StepEditor(picker)
+        editor.set_steps([])
+        observed: dict[str, object] = {}
+
+        def visible_dialog():
+            for child in editor.findChildren(StepDialog):
+                if child.isVisible():
+                    return child
+            return None
+
+        def interact() -> None:
+            """在模态循环里扮演用户：点「截取屏幕」、拖框松手。"""
+            dialog = visible_dialog()
+            observed["dialog"] = dialog
+            if dialog is None:
+                return
+            dialog.pick_template()  # 等价于点「截取屏幕」
+            observed["let_itself_away"] = not dialog.isVisible()
+            observed["busy_while_picking"] = picker.busy
+            picker._template_picker.selected.emit(ScreenRect(*BUTTON_AT, *BUTTON_SIZE))
+
+        def confirm() -> None:
+            dialog = observed.get("dialog")
+            if dialog is None or not dialog.isVisible():
+                observed["came_back"] = False
+                return
+            observed["came_back"] = True
+            observed["template_chars"] = len(dialog._template_b64)
+            dialog.accept()
+
+        def bail_out() -> None:
+            """兜底：万一流程没收尾，别让测试挂到 CI 超时。"""
+            observed["timed_out"] = True
+            dialog = visible_dialog()
+            if dialog is not None:
+                dialog.reject()
+
+        def fake_capture(region=None):
+            frame = _screen_with_button()
+            return _crop_frame(frame, region.x, region.y, region.width, region.height)
+
+        try:
+            with mock.patch.object(
+                position_picker, "capture_screen", fake_capture
+            ), mock.patch.object(position_picker, "HIDE_SETTLE_MS", 0):
+                QTimer.singleShot(30, interact)
+                QTimer.singleShot(300, confirm)
+                QTimer.singleShot(5000, bail_out)
+                editor.add_step(StepKind.WAIT)
+
+            self.assertFalse(observed.get("timed_out"), "对话框没有在预期时间内收尾")
+            self.assertTrue(observed.get("let_itself_away"), "拖框时对话框必须先让开")
+            self.assertTrue(observed.get("busy_while_picking"), "截取还没完成要算「忙」")
+            self.assertTrue(
+                observed.get("came_back"),
+                "截完模板对话框必须还在——hide() 掉它不能被当成用户取消",
+            )
+            self.assertEqual(observed.get("template_chars"), len(_button_template().encode()))
+            self.assertEqual(len(editor.steps()), 1, "点「确定」后这一步要真的进表")
+            self.assertIsInstance(editor.steps()[0], WaitStep)
+            self.assertEqual(editor.steps()[0].template, _button_template().encode())
+            self.assertEqual(editor._table.item(0, 1).text(), "找图")
+        finally:
+            editor.deleteLater()
+
     def test_find_image_dialog_test_match_reports_hit(self):
         from unittest import mock
 
@@ -2369,6 +2456,45 @@ class TestUI(unittest.TestCase):
             self.assertEqual(canceled, [1], "失败也应该让调用方收尾")
             self.assertFalse(picker.busy)
         finally:
+            picker.deleteLater()
+
+    def test_pick_coordinator_survives_an_unexpected_capture_error(self):
+        """抓屏炸出**没预料到**的异常时，请求方窗口和 busy 也必须复原。
+
+        以前 ``_restore()`` 只写在正常路径的尾部，异常一冒出来就跳过去了，
+        症状是「对话框/主窗口再也回不来，而且此后所有拾取都被 busy 挡回去」。
+        """
+        from unittest import mock
+
+        from PySide6.QtWidgets import QWidget
+
+        from app.ui import position_picker
+        from app.ui.position_picker import PickCoordinator
+        from app.win.geometry import ScreenRect
+
+        picker = PickCoordinator()
+        widget = QWidget()
+        failures: list[str] = []
+        picker.failed.connect(failures.append)
+
+        def broken(region=None):
+            raise RuntimeError("没预料到的错误类型（不是 OSError/ValueError）")
+
+        try:
+            with mock.patch.object(
+                position_picker, "capture_screen", broken
+            ), mock.patch.object(position_picker, "HIDE_SETTLE_MS", 0), mock.patch.object(
+                position_picker, "logger"  # 故意让这里出错，别把 traceback 打得到处都是
+            ):
+                self.assertTrue(picker.request_template(lambda template: None, hide_widget=widget))
+                picker._template_picker.selected.emit(ScreenRect(0, 0, 30, 30))
+                self.assertTrue(self._pump(lambda: bool(failures)))
+
+            self.assertIn("未预期的错误", failures[0])
+            self.assertFalse(picker.busy, "出意外也不能把后续所有拾取都锁死")
+            self.assertTrue(widget.isVisible(), "请求方窗口必须还回去")
+        finally:
+            widget.deleteLater()
             picker.deleteLater()
 
     def test_pick_coordinator_rejects_second_flow(self):

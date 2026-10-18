@@ -369,10 +369,17 @@ class PickCoordinator(QObject):
             template = Template.from_frame(capture_screen(rect))
         except (OSError, ValueError) as exc:
             failure = f"截取模板失败：{exc}"
-
-        self._restore()
-        if failure is not None:
             logger.error("%s", failure)
+        except Exception as exc:  # noqa: BLE001 - 见下：兜底也必须把请求方还回去
+            failure = f"截取模板时出现未预期的错误：{exc!r}"
+            logger.exception("%s", failure)
+        finally:
+            # 请求方的窗口是我们 hide() 掉的，``_mode`` 也只能在这里清掉。
+            # 所以这一步不是「正常路径的收尾」而是不变式：漏掉它的症状是
+            # 「对话框/主窗口再也回不来」，而且此后**所有**拾取都被 busy 挡回去。
+            self._restore()
+
+        if failure is not None:
             self.failed.emit(failure)
             if on_canceled is not None:
                 on_canceled()
@@ -388,10 +395,14 @@ class PickCoordinator(QObject):
             frame = capture_screen()
         except OSError as exc:
             failure = f"抓取屏幕失败：{exc}"
-
-        self._restore()
-        if failure is not None:
             logger.error("%s", failure)
+        except Exception as exc:  # noqa: BLE001 - 同上，不变式优先
+            failure = f"抓取屏幕时出现未预期的错误：{exc!r}"
+            logger.exception("%s", failure)
+        finally:
+            self._restore()  # 同样：无论如何都要把请求方还回去
+
+        if failure is not None:
             self.failed.emit(failure)
             return
         if callback is not None and frame is not None:
