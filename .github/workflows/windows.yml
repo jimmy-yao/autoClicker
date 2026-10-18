@@ -1,12 +1,14 @@
 name: Windows 验证
 
-# 三个 job，按「跑起来需要什么」分
+# 四个 job，按「跑起来需要什么」分
 # -------------------------------
 # · static（ubuntu）：快照一致性、探针判定逻辑、UIA 后端的逻辑 —— 都是纯文件读写 / 纯函数，
 #   不需要 Windows。
 # · integration（windows）：tests/test_win_integration.py —— 唯一一处「真的建窗口、真的投
 #   消息」的验证，只能在 Windows 上执行。
 # · smoke（windows）：tests/test_smoke.py，需要 PySide6，用 Qt 的 offscreen 平台插件。
+# · build（windows）：跑用户双击的那个 build.bat，把 exe 真的打出来、真的启动一次，
+#   再把产物传成 artifact。
 #
 # app/win/* 里带 DLL 绑定的那几个在 import 阶段就调 ctypes.WinDLL，所以带界面的那两套测试
 # **只能**在 Windows 上跑。UIA 那两层特意做成了「非 Windows 也能 import」，因此它的逻辑
@@ -138,3 +140,80 @@ jobs:
 
       - name: 跑冒烟测试
         run: python tests/test_smoke.py
+
+  # ---------------------------------------------------------------- 打包
+  build:
+    name: 打包 exe（PyInstaller）
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # build.bat 里那套冒烟测试要用到；下面真启动 exe 时也要
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖（含 PyInstaller）
+        # PySide6 不只是测试要用：PyInstaller 得能 import 到它才打得进去
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: 跑 build.bat
+        # 故意直接跑用户双击的那个脚本，而不是在这里再抄一遍 PyInstaller 参数：
+        # 那份参数表（尤其是一长串 --exclude-module）只有一处，改 build.bat 就等于
+        # 改 CI，不会漂移。脚本自带测试闸门，所以这几套测试在本工作流里跑了第二遍——
+        # 公开仓库不花分钟，换来的是「用户拿到的那条路径」被真的走一遍。
+        # 它结尾的 pause 在 CI 里会被跳过（脚本自己认 CI=true），否则会挂到超时。
+        run: .\build.bat
+
+      - name: 确认产物
+        run: |
+          $exe = Get-Item dist\AutoClicker.exe
+          "产物：{0}  {1:N1} MB" -f $exe.FullName, ($exe.Length / 1MB)
+
+      - name: 真启动一次打包出来的 exe
+        # 「PyInstaller 退出码是 0」只说明它把文件拼出来了，不说明这东西能跑——
+        # 少一个隐藏 import 的经典表现就是「打得出、一开就退」。
+        # 这里把它真的拉起来，等它写出日志文件，确认它没在启动过程中死掉。
+        run: |
+          # 先清掉可能残留的用户数据，下面才好在「有没有新日志」上做判断
+          Remove-Item -Recurse -Force "$env:LOCALAPPDATA\AutoClicker" -ErrorAction SilentlyContinue
+
+          $exeProcess = Start-Process -FilePath dist\AutoClicker.exe -PassThru
+          $log = Join-Path $env:LOCALAPPDATA "AutoClicker\logs\autoclicker.log"
+
+          # 单文件 exe 每次启动都要把几十 MB 解到临时目录，再叠加杀软扫描：
+          # 给足时间（90 秒），但只要中途退出了就立刻判负
+          $deadline = (Get-Date).AddSeconds(90)
+          while (-not (Test-Path $log) -and (Get-Date) -lt $deadline) {
+              if ($exeProcess.HasExited) {
+                  throw "exe 启动后立刻退出了（退出码 $($exeProcess.ExitCode)）——多半是打包漏了东西"
+              }
+              Start-Sleep -Milliseconds 500
+          }
+          if (-not (Test-Path $log)) {
+              throw "等了 90 秒也没等到日志文件：$log"
+          }
+
+          # 日志出现只说明「跑到了写日志那一步」；再等一会儿，确认窗口/热键/托盘
+          # 那一串装配没有把它搞崩
+          Start-Sleep -Seconds 5
+          if ($exeProcess.HasExited) {
+              throw "exe 在启动过程中崩了（退出码 $($exeProcess.ExitCode)）"
+          }
+          Stop-Process -Id $exeProcess.Id -Force
+
+          "启动正常，日志开头："
+          Get-Content $log -TotalCount 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoClicker-exe
+          path: dist/AutoClicker.exe
+          if-no-files-found: error
+          retention-days: 14

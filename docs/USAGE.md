@@ -37,7 +37,7 @@ python main.py
 
 ```powershell
 pip install pyinstaller
-build.bat            # 会先跑四套测试，任何一套不过就不打包
+build.bat            # 会先跑三套测试（冒烟/探针/UIA），任何一套不过就不打包
 ```
 
 产物 `dist\AutoClicker.exe`，单文件、无控制台窗口，双击即用。
